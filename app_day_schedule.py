@@ -11,7 +11,8 @@ import csv
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTimeEdit, QListWidget, QDialog,
-    QLineEdit, QListWidgetItem, QComboBox, QInputDialog, QMessageBox
+    QLineEdit, QListWidgetItem, QComboBox, QInputDialog, QMessageBox,
+    QTableWidget, QTableWidgetItem
 )
 from PySide6.QtCore import Qt, QTime, QRect, QTimer, QDateTime
 from PySide6.QtGui import QPainter, QColor, QBrush, QPen, QFont
@@ -815,6 +816,40 @@ class TimeBarWidget(QWidget):
             painter.drawText(status_rect, Qt.AlignCenter, "現在進行中のスケジュールはありません")
 
 
+class DatabaseViewer(QDialog):
+    """データベース内容を表示するダイアログ"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("DB確認")
+        self.setModal(True)
+        layout = QVBoxLayout(self)
+
+        # テーブルウィジェットを追加
+        self.table_widget = QTableWidget()
+        layout.addWidget(self.table_widget)
+
+        # データベースの内容を読み込む
+        self.load_database_content()
+
+    def load_database_content(self):
+        """データベースの内容をテーブルに読み込む"""
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute('SELECT * FROM schedules')
+        rows = c.fetchall()
+        column_names = [description[0] for description in c.description]
+
+        self.table_widget.setRowCount(len(rows))
+        self.table_widget.setColumnCount(len(column_names))
+        self.table_widget.setHorizontalHeaderLabels(column_names)
+
+        for row_index, row_data in enumerate(rows):
+            for column_index, data in enumerate(row_data):
+                self.table_widget.setItem(row_index, column_index, QTableWidgetItem(str(data)))
+
+        conn.close()
+
+
 class MainWindow(QMainWindow):
     """メインウィンドウ"""
     def __init__(self):
@@ -891,7 +926,12 @@ class MainWindow(QMainWindow):
         manage_profile_button = QPushButton("プロファイル管理")
         manage_profile_button.clicked.connect(self.manage_profiles)
         profile_layout.addWidget(manage_profile_button)
-        
+
+        # DB確認ボタンを追加
+        db_view_button = QPushButton("DB確認")
+        db_view_button.clicked.connect(self.view_database)
+        profile_layout.addWidget(db_view_button)
+
         # 既存のレイアウトにプロファイル選択を追加
         layout = self.centralWidget().layout()
         layout.insertLayout(0, profile_layout)
@@ -1115,6 +1155,11 @@ class MainWindow(QMainWindow):
             self.timebar.update()
         elif result == 2:  # 削除
             self.delete_schedule(schedule)
+
+    def view_database(self):
+        """データベース内容を表示するダイアログを開く"""
+        dialog = DatabaseViewer(self)
+        dialog.exec()
 
 
 class ProfileManageDialog(QDialog):
