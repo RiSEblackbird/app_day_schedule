@@ -308,20 +308,20 @@ class Profile:
 
     @db_operation
     def save_to_db(conn, self):
-        """スケジュールをデータベースに保存"""
+        """プロファイルをデータベースに保存"""
         c = conn.cursor()
         if self.id is None:
             c.execute('''
-                INSERT INTO schedules (profile_id, name, start_time, end_time, color)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (self.profile_id, self.name, self.start_time, self.end_time, self.color))
+                INSERT INTO profiles (name)
+                VALUES (?)
+            ''', (self.name,))
             self.id = c.lastrowid
         else:
             c.execute('''
-                UPDATE schedules
-                SET profile_id=?, name=?, start_time=?, end_time=?, color=?
+                UPDATE profiles
+                SET name=?
                 WHERE id=?
-            ''', (self.profile_id, self.name, self.start_time, self.end_time, self.color, self.id))
+            ''', (self.name, self.id))
         conn.commit()
 
     @staticmethod
@@ -1239,7 +1239,7 @@ try:
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
-except Exception as e:
+except Exception:
     trace = get_exception_trace()
     print("エラーが発生しました：", trace)
     sys.exit(1)
