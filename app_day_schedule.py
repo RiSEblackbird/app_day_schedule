@@ -612,35 +612,58 @@ class TimeBarWidget(QWidget):
         base_time = QTime.fromString(self.start_time, "HH:mm")
         base_minutes = base_time.hour() * 60 + base_time.minute()
         
-        # スケジュールを時間長でソート（短い順）して検索
+        # スケジュールを時間長でソート（長い順）
         sorted_schedules = []
         for schedule in self.schedules:
             start_minutes, end_minutes = schedule.get_minutes()
             duration = end_minutes - start_minutes if end_minutes > start_minutes else (24 * 60 - start_minutes + end_minutes)
             sorted_schedules.append((schedule, duration))
         
-        # 短い順にソート（描画順序と逆順）
-        sorted_schedules.sort(key=lambda x: x[1])
+        # 長い順にソート
+        sorted_schedules.sort(key=lambda x: -x[1])
         
-        # マウス位置のスケジュールを検索
-        for schedule, _ in sorted_schedules:
+        # まず、短いスケジュールの領域をチェック
+        for schedule, _ in reversed(sorted_schedules):  # 短い順に
             x_start, x_end, crosses_midnight = self._calculate_schedule_position(
                 schedule, width, base_minutes
             )
             
-            # スケジュールの縦位置を考慮
             is_overlapped = any(self._check_overlap(schedule, s) for s in self.schedules if s != schedule)
-            y_pos = 40 + (BAR_HEIGHT // 2 if is_overlapped else 0)
-            height = BAR_HEIGHT // 2 if is_overlapped else BAR_HEIGHT
-            
-            # 位置判定
-            if y_pos <= pos.y() <= y_pos + height:
+            if is_overlapped:
+                y_pos = 40 + BAR_HEIGHT // 2
+                height = BAR_HEIGHT // 2
+                
+                # X座標の判定
+                x_in_range = False
                 if crosses_midnight:
-                    if (0 <= pos.x() <= x_end) or (x_start <= pos.x() <= width):
-                        return schedule
+                    x_in_range = (0 <= pos.x() <= x_end) or (x_start <= pos.x() <= width)
                 else:
-                    if x_start <= pos.x() <= x_end:
-                        return schedule
+                    x_in_range = (x_start <= pos.x() <= x_end)
+                    
+                # 短いスケジュールの領域内ならそれを返す
+                if x_in_range and (y_pos <= pos.y() <= y_pos + height):
+                    return schedule
+        
+        # 短いスケジュールの領域になければ、長いスケジュールをチェック
+        for schedule, _ in sorted_schedules:  # 長い順に
+            x_start, x_end, crosses_midnight = self._calculate_schedule_position(
+                schedule, width, base_minutes
+            )
+            
+            is_overlapped = any(self._check_overlap(schedule, s) for s in self.schedules if s != schedule)
+            y_pos = 40
+            height = BAR_HEIGHT if not is_overlapped else BAR_HEIGHT // 2
+            
+            # X座標の判定
+            x_in_range = False
+            if crosses_midnight:
+                x_in_range = (0 <= pos.x() <= x_end) or (x_start <= pos.x() <= width)
+            else:
+                x_in_range = (x_start <= pos.x() <= x_end)
+                
+            # 長いスケジュールの領域内ならそれを返す
+            if x_in_range and (y_pos <= pos.y() <= y_pos + height):
+                return schedule
         
         return None
 
