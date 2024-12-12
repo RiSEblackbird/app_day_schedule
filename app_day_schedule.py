@@ -607,27 +607,40 @@ class TimeBarWidget(QWidget):
         """指定された位置にあるスケジュールを取得"""
         if not (40 <= pos.y() <= 40 + BAR_HEIGHT):  # バーの範囲外
             return None
-            
+        
         width = self.width()
         base_time = QTime.fromString(self.start_time, "HH:mm")
         base_minutes = base_time.hour() * 60 + base_time.minute()
         
-        # クリック位置を時間に変換
-        click_minutes = (pos.x() * 24 * 60) // width
-        
+        # スケジュールを時間長でソート（短い順）して検索
+        sorted_schedules = []
         for schedule in self.schedules:
+            start_minutes, end_minutes = schedule.get_minutes()
+            duration = end_minutes - start_minutes if end_minutes > start_minutes else (24 * 60 - start_minutes + end_minutes)
+            sorted_schedules.append((schedule, duration))
+        
+        # 短い順にソート（描画順序と逆順）
+        sorted_schedules.sort(key=lambda x: x[1])
+        
+        # マウス位置のスケジュールを検索
+        for schedule, _ in sorted_schedules:
             x_start, x_end, crosses_midnight = self._calculate_schedule_position(
                 schedule, width, base_minutes
             )
             
-            if crosses_midnight:
-                # 日をまたぐ場合
-                if (0 <= pos.x() <= x_end) or (x_start <= pos.x() <= width):
-                    return schedule
-            else:
-                # 通常の場合
-                if x_start <= pos.x() <= x_end:
-                    return schedule
+            # スケジュールの縦位置を考慮
+            is_overlapped = any(self._check_overlap(schedule, s) for s in self.schedules if s != schedule)
+            y_pos = 40 + (BAR_HEIGHT // 2 if is_overlapped else 0)
+            height = BAR_HEIGHT // 2 if is_overlapped else BAR_HEIGHT
+            
+            # 位置判定
+            if y_pos <= pos.y() <= y_pos + height:
+                if crosses_midnight:
+                    if (0 <= pos.x() <= x_end) or (x_start <= pos.x() <= width):
+                        return schedule
+                else:
+                    if x_start <= pos.x() <= x_end:
+                        return schedule
         
         return None
 
