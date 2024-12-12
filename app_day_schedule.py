@@ -724,12 +724,89 @@ class TimeBarWidget(QWidget):
         painter.setPen(QPen(QColor("#cccccc")))
         painter.drawRect(background_rect)
 
-    def _draw_schedule_rect(self, painter, rect, schedule):
+    def _draw_schedules(self, painter):
+        """全スケジュールの描画"""
+        width = self.width()
+        base_time = QTime.fromString(self.start_time, "HH:mm")
+        base_minutes = base_time.hour() * 60 + base_time.minute()
+        
+        # スケジュールを時間長でソート（長い順）
+        sorted_schedules = []
+        for schedule in self.schedules:
+            start = QTime.fromString(schedule.start_time, "HH:mm")
+            end = QTime.fromString(schedule.end_time, "HH:mm")
+            start_minutes, end_minutes = schedule.get_minutes()
+            duration = end_minutes - start_minutes if end_minutes > start_minutes else (24 * 60 - start_minutes + end_minutes)
+            sorted_schedules.append((schedule, duration))
+        
+        # 長い順にソート
+        sorted_schedules.sort(key=lambda x: (-x[1], x[0].start_time))
+        
+        # まず長いスケジュールを描画
+        for i, (schedule1, duration1) in enumerate(sorted_schedules):
+            # 他のスケジュールとの重なりをチェック
+            is_overlapped = False
+            for schedule2, duration2 in sorted_schedules[:i]:  # 自分より前（長い）スケジュールとチェック
+                if self._check_overlap(schedule1, schedule2):
+                    is_overlapped = True
+                    break
+            
+            x_start, x_end, crosses_midnight = self._calculate_schedule_position(
+                schedule1, width, base_minutes
+            )
+            
+            # 重なっている場合は下部に配置
+            y_pos = 40 + (BAR_HEIGHT // 2 if is_overlapped else 0)
+            height = BAR_HEIGHT // 2 if is_overlapped else BAR_HEIGHT
+            
+            if crosses_midnight:
+                self._draw_schedule_rect(
+                    painter,
+                    QRect(x_start, y_pos, width - x_start, height),
+                    schedule1,
+                    is_overlapped
+                )
+                self._draw_schedule_rect(
+                    painter,
+                    QRect(0, y_pos, x_end, height),
+                    schedule1,
+                    is_overlapped
+                )
+            else:
+                self._draw_schedule_rect(
+                    painter,
+                    QRect(x_start, y_pos, x_end - x_start, height),
+                    schedule1,
+                    is_overlapped
+                )
+
+    def _check_overlap(self, schedule1, schedule2):
+        """2つのスケジュール間の重なりをチェック（5分以上の重なりがある場合にTrue）"""
+        start1_minutes, end1_minutes = schedule1.get_minutes()
+        start2_minutes, end2_minutes = schedule2.get_minutes()
+        
+        # 日をまたぐ場合の調整
+        if end1_minutes < start1_minutes:
+            end1_minutes += 24 * 60
+        if end2_minutes < start2_minutes:
+            end2_minutes += 24 * 60
+        
+        # 重なりの判定
+        overlap_start = max(start1_minutes, start2_minutes)
+        overlap_end = min(end1_minutes, end2_minutes)
+        
+        return overlap_end - overlap_start >= 5
+
+    def _draw_schedule_rect(self, painter, rect, schedule, is_overlapped):
         """個別のスケジュール矩形の描画"""
         # 境界線の幅を1ピクセル確保
         adjusted_rect = rect.adjusted(1, 1, -1, -1)
         
-        painter.setBrush(QBrush(QColor(schedule.color)))
+        # 重なっている場合は半透明に
+        color = QColor(schedule.color)
+        if is_overlapped:
+            color.setAlpha(200)  # 透明度を設定
+        painter.setBrush(QBrush(color))
         painter.setPen(QPen(QColor("#666666")))
         painter.drawRect(adjusted_rect)
         
@@ -740,21 +817,23 @@ class TimeBarWidget(QWidget):
         # 経過時間と残り時間の計算
         is_current, elapsed_minutes, remaining_minutes = self._get_time_info(schedule)
         
-        # 領域の幅に応じてテキストの表示方法を変更
+        # テキスト表示位置の調整
         text_rect = adjusted_rect.adjusted(2, 2, -2, -2)
-        if adjusted_rect.width() >= 150:  # 十分な幅がある場合
-            schedule_text = f"{schedule.name}\n{schedule.start_time}-{schedule.end_time}"
-            if is_current:
-                elapsed_str = self._format_time(elapsed_minutes)
-                remaining_str = self._format_time(remaining_minutes)
-                schedule_text += f"\n経過: {elapsed_str} / 残り: {remaining_str}"
+        
+        # 領域の幅に応じてテキストの表示方法を変更
+        if adjusted_rect.width() >= 150:
+            if is_overlapped:
+                schedule_text = f"{schedule.name}\n{schedule.start_time}-{schedule.end_time}"
+            else:
+                schedule_text = f"{schedule.name}\n{schedule.start_time}-{schedule.end_time}"
+                if is_current:
+                    elapsed_str = self._format_time(elapsed_minutes)
+                    remaining_str = self._format_time(remaining_minutes)
+                    schedule_text += f"\n経過: {elapsed_str} / 残り: {remaining_str}"
         elif adjusted_rect.width() >= 100:
             schedule_text = f"{schedule.name}\n{schedule.start_time}-{schedule.end_time}"
-            if is_current:
-                elapsed_str = self._format_time(elapsed_minutes)
-                schedule_text += f"\n経過: {elapsed_str}"
         elif adjusted_rect.width() >= 45:
-            schedule_text = f"{schedule.name}\n{schedule.start_time}-\n{schedule.end_time}"
+            schedule_text = f"{schedule.name}\n{schedule.start_time}"
         else:
             schedule_text = schedule.name
         
@@ -778,41 +857,6 @@ class TimeBarWidget(QWidget):
         x_end = (end_minutes * width) // (24 * 60)
         
         return x_start, x_end, end_minutes < start_minutes
-
-    def _draw_schedules(self, painter):
-        """全スケジュールの描画"""
-        width = self.width()
-        base_time = QTime.fromString(self.start_time, "HH:mm")
-        base_minutes = base_time.hour() * 60 + base_time.minute()
-        
-        # スケジュールを開始時刻でソート
-        sorted_schedules = sorted(self.schedules, 
-                                key=lambda s: QTime.fromString(s.start_time, "HH:mm"))
-        
-        for schedule in sorted_schedules:
-            x_start, x_end, crosses_midnight = self._calculate_schedule_position(
-                schedule, width, base_minutes
-            )
-            
-            if crosses_midnight:
-                # 日をまたぐ場合は2つの矩形を描画
-                self._draw_schedule_rect(
-                    painter,
-                    QRect(x_start, 40, width - x_start, BAR_HEIGHT),
-                    schedule
-                )
-                self._draw_schedule_rect(
-                    painter,
-                    QRect(0, 40, x_end, BAR_HEIGHT),
-                    schedule
-                )
-            else:
-                # 通常の描画
-                self._draw_schedule_rect(
-                    painter,
-                    QRect(x_start, 40, x_end - x_start, BAR_HEIGHT),
-                    schedule
-                )
 
     def _draw_current_time(self, painter):
         """現在時刻の赤線描画"""
