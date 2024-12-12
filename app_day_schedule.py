@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTimeEdit, QListWidget, QDialog,
     QLineEdit, QListWidgetItem, QComboBox, QInputDialog, QMessageBox,
-    QTableWidget, QTableWidgetItem
+    QTableWidget, QTableWidgetItem, QToolTip
 )
 from PySide6.QtCore import Qt, QTime, QRect, QTimer, QDateTime
 from PySide6.QtGui import QPainter, QColor, QBrush, QPen, QFont
@@ -308,20 +308,20 @@ class Profile:
 
     @db_operation
     def save_to_db(conn, self):
-        """プロファイルをデータベースに保存"""
+        """スケジュールをデータベースに保存"""
         c = conn.cursor()
         if self.id is None:
             c.execute('''
-                INSERT INTO profiles (name)
-                VALUES (?)
-            ''', (self.name,))
+                INSERT INTO schedules (profile_id, name, start_time, end_time, color)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (self.profile_id, self.name, self.start_time, self.end_time, self.color))
             self.id = c.lastrowid
         else:
             c.execute('''
-                UPDATE profiles
-                SET name=?
+                UPDATE schedules
+                SET profile_id=?, name=?, start_time=?, end_time=?, color=?
                 WHERE id=?
-            ''', (self.name, self.id))
+            ''', (self.profile_id, self.name, self.start_time, self.end_time, self.color, self.id))
         conn.commit()
 
     @staticmethod
@@ -554,6 +554,82 @@ class TimeBarWidget(QWidget):
         self.status_height = 40
         self.setMinimumHeight(BAR_HEIGHT + 60 + self.status_height)
         self.highlight_time = QTime.fromString(start_time, "HH:mm")
+        
+        # ツールチップ関連の追加
+        self.setMouseTracking(True)  # マウストラッキングを有効化
+        self.tooltip_timer = QTimer(self)
+        self.tooltip_timer.setSingleShot(True)
+        self.tooltip_timer.timeout.connect(self.showScheduleTooltip)
+        self.current_schedule = None
+        self.tooltip_position = None
+
+    def mouseMoveEvent(self, event):
+        """マウス移動時のイベントハンドラ"""
+        schedule = self._get_schedule_at_position(event.pos())
+        
+        if schedule != self.current_schedule:
+            self.tooltip_timer.stop()
+            QToolTip.hideText()
+            
+            if schedule:
+                self.current_schedule = schedule
+                self.tooltip_position = event.globalPos()
+                self.tooltip_timer.start(500)  # 500ms後にツールチップを表示
+            else:
+                self.current_schedule = None
+                self.tooltip_position = None
+
+    def leaveEvent(self, event):
+        """マウスがウィジェットを離れた時のイベントハンドラ"""
+        self.tooltip_timer.stop()
+        QToolTip.hideText()
+        self.current_schedule = None
+        self.tooltip_position = None
+
+    def showScheduleTooltip(self):
+        """スケジュールのツールチップを表示"""
+        if self.current_schedule and self.tooltip_position:
+            is_current, elapsed_minutes, remaining_minutes = self._get_time_info(self.current_schedule)
+            
+            tooltip_text = (
+                f"予定名: {self.current_schedule.name}\n"
+                f"時間: {self.current_schedule.start_time} - {self.current_schedule.end_time}"
+            )
+            
+            if is_current:
+                elapsed_str = self._format_time(elapsed_minutes)
+                remaining_str = self._format_time(remaining_minutes)
+                tooltip_text += f"\n経過時間: {elapsed_str}\n残り時間: {remaining_str}"
+            
+            QToolTip.showText(self.tooltip_position, tooltip_text)
+
+    def _get_schedule_at_position(self, pos):
+        """指定された位置にあるスケジュールを取得"""
+        if not (40 <= pos.y() <= 40 + BAR_HEIGHT):  # バーの範囲外
+            return None
+            
+        width = self.width()
+        base_time = QTime.fromString(self.start_time, "HH:mm")
+        base_minutes = base_time.hour() * 60 + base_time.minute()
+        
+        # クリック位置を時間に変換
+        click_minutes = (pos.x() * 24 * 60) // width
+        
+        for schedule in self.schedules:
+            x_start, x_end, crosses_midnight = self._calculate_schedule_position(
+                schedule, width, base_minutes
+            )
+            
+            if crosses_midnight:
+                # 日をまたぐ場合
+                if (0 <= pos.x() <= x_end) or (x_start <= pos.x() <= width):
+                    return schedule
+            else:
+                # 通常の場合
+                if x_start <= pos.x() <= x_end:
+                    return schedule
+        
+        return None
 
     def set_start_time(self, time_str):
         """開始時刻を設定し、その位置をハイライト表示"""
@@ -1239,7 +1315,7 @@ try:
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
-except Exception:
+except Exception as e:
     trace = get_exception_trace()
     print("エラーが発生しました：", trace)
     sys.exit(1)
