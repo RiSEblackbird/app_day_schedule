@@ -1331,12 +1331,16 @@ class ProfileManageDialog(QDialog):
         self.update_profile_list()
         layout.addWidget(self.profile_list)
         
-        # ボタン
+        # ボタンレイアウト
         button_layout = QHBoxLayout()
         
         add_button = QPushButton("追加")
         add_button.clicked.connect(self.add_profile)
         button_layout.addWidget(add_button)
+        
+        edit_button = QPushButton("編集")  # 編集ボタンを追加
+        edit_button.clicked.connect(self.edit_profile)
+        button_layout.addWidget(edit_button)
         
         delete_button = QPushButton("削除")
         delete_button.clicked.connect(self.delete_profile)
@@ -1364,6 +1368,35 @@ class ProfileManageDialog(QDialog):
             profile = Profile(name)
             profile.save_profile_to_db()
             self.update_profile_list()
+
+    def edit_profile(self):
+        """選択されたプロファイルの名前を編集"""
+        current_item = self.profile_list.currentItem()
+        if current_item:
+            profile_id = current_item.data(Qt.UserRole)
+            if profile_id == 1:
+                QMessageBox.warning(self, "エラー", "デフォルトプロファイルは編集できません")
+                return
+            
+            current_name = current_item.text()
+            new_name, ok = QInputDialog.getText(
+                self, 
+                "プロファイル編集", 
+                "新しいプロファイル名:",
+                QLineEdit.Normal,
+                current_name
+            )
+            
+            if ok and new_name and new_name != current_name:
+                try:
+                    conn = sqlite3.connect(DB_NAME)
+                    c = conn.cursor()
+                    c.execute('UPDATE profiles SET name = ? WHERE id = ?', (new_name, profile_id))
+                    conn.commit()
+                    conn.close()
+                    self.update_profile_list()
+                except sqlite3.Error as e:
+                    QMessageBox.warning(self, "エラー", f"プロファイル名の更新に失敗しました: {str(e)}")
 
     def delete_profile(self):
         """選択されたプロファイルを削除"""
