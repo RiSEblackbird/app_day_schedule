@@ -241,7 +241,7 @@ class Schedule:
         self.end_time = end_time
         self.color = color
 
-    def save_to_db(self):
+    def save_schedule_to_db(self):
         """スケジュールをデータベースに保存"""
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
@@ -306,22 +306,21 @@ class Profile:
         self.id = id
         self.name = name
 
-    @db_operation
-    def save_to_db(conn, self):
-        """スケジュールをデータベースに保存"""
+    def save_profile_to_db(self, conn):
+        """プロファイルをデータベースに保存"""
         c = conn.cursor()
         if self.id is None:
             c.execute('''
-                INSERT INTO schedules (profile_id, name, start_time, end_time, color)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (self.profile_id, self.name, self.start_time, self.end_time, self.color))
+                INSERT INTO profiles (name)
+                VALUES (?)
+            ''', (self.name,))
             self.id = c.lastrowid
         else:
             c.execute('''
-                UPDATE schedules
-                SET profile_id=?, name=?, start_time=?, end_time=?, color=?
+                UPDATE profiles
+                SET name=?
                 WHERE id=?
-            ''', (self.profile_id, self.name, self.start_time, self.end_time, self.color, self.id))
+            ''', (self.name, self.id))
         conn.commit()
 
     @staticmethod
@@ -1240,7 +1239,7 @@ class MainWindow(QMainWindow):
                 data['color'],
                 profile_id=self.current_profile_id
             )
-            schedule.save_to_db()
+            schedule.save_schedule_to_db()
             self.schedules = Schedule.load_all_from_db(self.current_profile_id)
             self.update_schedule_list()
             self.timebar.schedules = self.schedules
@@ -1298,7 +1297,7 @@ class MainWindow(QMainWindow):
             schedule.end_time = data['end_time']
             schedule.color = data['color']
             schedule.profile_id = data['profile_id']
-            schedule.save_to_db()
+            schedule.save_schedule_to_db()
             
             # プロファイルが変更された場合は現在のリストから削除
             if old_profile == self.current_profile_id and schedule.profile_id != self.current_profile_id:
@@ -1363,7 +1362,7 @@ class ProfileManageDialog(QDialog):
         name, ok = QInputDialog.getText(self, "プロファイル追加", "プロファイル名:")
         if ok and name:
             profile = Profile(name)
-            profile.save_to_db()
+            profile.save_profile_to_db()
             self.update_profile_list()
 
     def delete_profile(self):
