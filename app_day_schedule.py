@@ -12,10 +12,11 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTimeEdit, QListWidget, QDialog,
     QLineEdit, QListWidgetItem, QComboBox, QInputDialog, QMessageBox,
-    QTableWidget, QTableWidgetItem, QToolTip
+    QTableWidget, QTableWidgetItem, QToolTip, QCheckBox, QProgressBar
 )
 from PySide6.QtCore import Qt, QTime, QRect, QTimer, QDateTime
 from PySide6.QtGui import QPainter, QColor, QBrush, QPen, QFont
+import winsound
 
 # 定数定義
 WINDOW_TITLE = "1日のスケジュール設計"
@@ -1047,6 +1048,31 @@ class MainWindow(QMainWindow):
         time_layout.addWidget(self.date_time_label)
         time_layout.addWidget(self.seconds_label)
         
+        # ポモドーロ用トグルと経過表示
+        self.pomodoro_switch = QCheckBox("ポモドーロ")
+        self.pomodoro_switch.setChecked(False)
+        self.pomodoro_switch.toggled.connect(self.on_pomodoro_toggled)
+        time_layout.addWidget(self.pomodoro_switch)
+        
+        self.pomodoro_elapsed_label = QLabel()
+        self.pomodoro_elapsed_label.setStyleSheet("font-size: 12px; color: #555;")
+        self.pomodoro_elapsed_label.setVisible(False)
+        time_layout.addWidget(self.pomodoro_elapsed_label)
+
+        # 進捗バー（25分を100%とする）
+        self.pomodoro_progress = QProgressBar()
+        self.pomodoro_progress.setRange(0, 25 * 60)
+        self.pomodoro_progress.setVisible(False)
+        self.pomodoro_progress.setTextVisible(False)
+        self.pomodoro_progress.setFixedWidth(160)
+        time_layout.addWidget(self.pomodoro_progress)
+
+        # 一時停止/再開ボタン
+        self.pomodoro_pause_button = QPushButton("一時停止")
+        self.pomodoro_pause_button.setVisible(False)
+        self.pomodoro_pause_button.clicked.connect(self.on_pomodoro_pause_resume)
+        time_layout.addWidget(self.pomodoro_pause_button)
+        
         # タイムバー
         self.timebar = TimeBarWidget(self.start_time, self.schedules)
         layout.addWidget(self.timebar)
@@ -1056,6 +1082,19 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.update_clock)
         self.timer.start(1000)  # 1秒ごとに更新
         
+        # ポモドーロ管理用タイマー
+        self.pomodoro_running = False
+        self.pomodoro_start_dt = None
+        self.pomodoro_accumulated_ms = 0  # 一時停止と再開に対応
+        self.pomodoro_paused = False
+        self.pomodoro_timer_25 = QTimer(self)
+        self.pomodoro_timer_25.setSingleShot(True)
+        self.pomodoro_timer_25.timeout.connect(self.on_pomodoro_25min)
+        self.break_close_timer = QTimer(self)
+        self.break_close_timer.setSingleShot(True)
+        self.break_close_timer.timeout.connect(self.on_break_end)
+        self.break_dialog = None
+
         # 初回の時刻表示
         self.update_clock()
         
@@ -1171,6 +1210,20 @@ class MainWindow(QMainWindow):
 
         # TimeBarWidgetを更新
         self.timebar.update()
+
+        # ポモドーロ経過表示
+        if self.pomodoro_running and self.pomodoro_start_dt is not None:
+            if not self.pomodoro_paused:
+                current_elapsed_ms = self.pomodoro_accumulated_ms + self.pomodoro_start_dt.msecsTo(current)
+            else:
+                current_elapsed_ms = self.pomodoro_accumulated_ms
+            elapsed_min = current_elapsed_ms // 60000
+            self.pomodoro_elapsed_label.setText(f"経過: {int(elapsed_min)} 分")
+            # 進捗バー更新（秒単位）
+            self.pomodoro_progress.setValue(int(current_elapsed_ms // 1000))
+            # 25分に到達したら手動チェック（タイマーが停止時でも検出）
+            if current_elapsed_ms >= 25 * 60 * 1000 and self.break_dialog is None:
+                self.on_pomodoro_25min()
 
     def on_item_double_clicked(self, item):
         """リストアイテムのダブルクリックハンドラ"""
@@ -1316,6 +1369,127 @@ class MainWindow(QMainWindow):
         dialog = DatabaseViewer(self)
         dialog.exec()
 
+    # === ポモドーロ関連 ===
+    def on_pomodoro_toggled(self, checked):
+        self.pomodoro_running = checked
+        self.pomodoro_elapsed_label.setVisible(checked)
+        self.pomodoro_progress.setVisible(checked)
+        self.pomodoro_pause_button.setVisible(checked)
+        if checked:
+            self.pomodoro_paused = False
+            self.pomodoro_accumulated_ms = 0
+            self.pomodoro_start_dt = QDateTime.currentDateTime()
+            self.pomodoro_elapsed_label.setText("経過: 0 分")
+            self.pomodoro_progress.setValue(0)
+            # 25分後に休憩ダイアログ（基本はタイマー、停止状態はupdate_clock側で検出）
+            self.pomodoro_timer_25.start(25 * 60 * 1000)
+            # スタート効果音
+            self._play_sound_start()
+        else:
+            self.pomodoro_timer_25.stop()
+            self._close_break_dialog_if_needed()
+            self.pomodoro_start_dt = None
+            self.pomodoro_accumulated_ms = 0
+            self.pomodoro_paused = False
+            # 停止効果音
+            self._play_sound_stop()
+
+    def on_pomodoro_25min(self):
+        if not self.pomodoro_running:
+            return
+        # 作業終了→5分休憩開始ダイアログ
+        self._show_break_dialog()
+        # 5分後に自動クローズ
+        self.break_close_timer.start(5 * 60 * 1000)
+        # 25分経過効果音
+        self._play_sound_25min()
+
+    def on_pomodoro_pause_resume(self):
+        if not self.pomodoro_running:
+            return
+        if not self.pomodoro_paused:
+            # 一時停止へ
+            if self.pomodoro_start_dt is not None:
+                self.pomodoro_accumulated_ms += self.pomodoro_start_dt.msecsTo(QDateTime.currentDateTime())
+            self.pomodoro_start_dt = None
+            self.pomodoro_paused = True
+            self.pomodoro_pause_button.setText("再開")
+            # 25分タイマーは停止（update_clockでしきい値判定）
+            self.pomodoro_timer_25.stop()
+        else:
+            # 再開
+            self.pomodoro_start_dt = QDateTime.currentDateTime()
+            self.pomodoro_paused = False
+            self.pomodoro_pause_button.setText("一時停止")
+            # 残り時間があれば25分タイマーを再セット
+            remaining_ms = max(0, 25 * 60 * 1000 - self.pomodoro_accumulated_ms)
+            if remaining_ms > 0:
+                self.pomodoro_timer_25.start(remaining_ms)
+
+    def _show_break_dialog(self):
+        if self.break_dialog is not None:
+            try:
+                self.break_dialog.close()
+            except Exception:
+                pass
+        self.break_dialog = QDialog(self)
+        self.break_dialog.setWindowTitle("休憩 (5分)")
+        v = QVBoxLayout(self.break_dialog)
+        label = QLabel("25分経過。5分休憩しましょう。\nダイアログは5分後に自動的に閉じます。")
+        v.addWidget(label)
+        btn = QPushButton("今すぐ閉じる")
+        btn.clicked.connect(self.on_break_end)
+        v.addWidget(btn)
+        self.break_dialog.setModal(False)
+        self.break_dialog.show()
+
+    def on_break_end(self):
+        # 休憩終了効果音
+        self._play_sound_break_end()
+        self._close_break_dialog_if_needed()
+        # 自動的にトグルをOFFに戻す（1サイクル）
+        if self.pomodoro_switch.isChecked():
+            self.pomodoro_switch.setChecked(False)
+
+    def _close_break_dialog_if_needed(self):
+        if self.break_dialog is not None:
+            try:
+                self.break_dialog.close()
+            except Exception:
+                pass
+            self.break_dialog = None
+        self.break_close_timer.stop()
+
+    # 効果音
+    def _play_sound_start(self):
+        try:
+            winsound.Beep(880, 200)
+            winsound.Beep(988, 200)
+        except Exception:
+            pass
+
+    def _play_sound_stop(self):
+        try:
+            winsound.Beep(660, 180)
+        except Exception:
+            pass
+
+    def _play_sound_25min(self):
+        try:
+            winsound.Beep(523, 200)
+            winsound.Beep(659, 200)
+            winsound.Beep(784, 300)
+        except Exception:
+            pass
+
+    def _play_sound_break_end(self):
+        try:
+            winsound.Beep(784, 200)
+            winsound.Beep(659, 200)
+            winsound.Beep(523, 300)
+        except Exception:
+            pass
+
 
 class ProfileManageDialog(QDialog):
     """プロファイル管理ダイアログ"""
@@ -1366,7 +1540,8 @@ class ProfileManageDialog(QDialog):
         name, ok = QInputDialog.getText(self, "プロファイル追加", "プロファイル名:")
         if ok and name:
             profile = Profile(name)
-            profile.save_profile_to_db()
+            with get_db_connection() as conn:
+                profile.save_profile_to_db(conn)
             self.update_profile_list()
 
     def edit_profile(self):
