@@ -1,7 +1,6 @@
 # 1日のスケジュール設計アプリ
 
-![image](https://github.com/user-attachments/assets/2e379331-7442-42d6-b10c-2ff0f59c1973)
-
+<img width="1207" height="433" alt="image" src="https://github.com/user-attachments/assets/66116d76-4229-4e96-8407-72d92c3a306f" />
 
 ## 概要
 このアプリケーションは、1日のスケジュールを視覚的に管理・設計するためのツール。24時間のタイムラインに沿ってスケジュールを配置し、現在の進行状況をリアルタイムで確認可能。
@@ -60,3 +59,4 @@
 - プロファイル削除時は紐づくスケジュールも削除
 - デフォルトプロファイルは削除不可
 - 効果音はWindows環境（winsound）で動作します
+
