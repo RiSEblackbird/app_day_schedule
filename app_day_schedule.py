@@ -1053,6 +1053,11 @@ class MainWindow(QMainWindow):
         self.pomodoro_switch.setChecked(False)
         self.pomodoro_switch.toggled.connect(self.on_pomodoro_toggled)
         time_layout.addWidget(self.pomodoro_switch)
+        # 予定アラームトグル（ポモドーロの右側）
+        self.alarm_switch = QCheckBox("予定アラーム")
+        self.alarm_switch.setChecked(False)
+        self.alarm_switch.toggled.connect(self.on_alarm_toggled)
+        time_layout.addWidget(self.alarm_switch)
         
         self.pomodoro_elapsed_label = QLabel()
         self.pomodoro_elapsed_label.setStyleSheet("font-size: 12px; color: #555;")
@@ -1094,6 +1099,11 @@ class MainWindow(QMainWindow):
         self.break_close_timer.setSingleShot(True)
         self.break_close_timer.timeout.connect(self.on_break_end)
         self.break_dialog = None
+
+        # 予定アラーム用の状態
+        self.alarm_enabled = False
+        self.alarm_fired_today = set()
+        self.alarm_date_str = QDateTime.currentDateTime().toString("yyyy-MM-dd")
 
         # 初回の時刻表示
         self.update_clock()
@@ -1225,6 +1235,36 @@ class MainWindow(QMainWindow):
             if current_elapsed_ms >= 25 * 60 * 1000 and self.break_dialog is None:
                 self.on_pomodoro_25min()
 
+        # 予定アラーム（開始・終了の通知音）
+        if self.alarm_enabled:
+            date_str = current.toString("yyyy-MM-dd")
+            if date_str != self.alarm_date_str:
+                # 日付が変わったら当日の通知済みフラグをリセット
+                self.alarm_date_str = date_str
+                self.alarm_fired_today.clear()
+
+            # 1分境界（秒=0）の時だけチェックして重複を防止
+            if current.time().second() == 0:
+                now_hm = current.toString("HH:mm")
+                for schedule in list(self.schedules):
+                    # 開始時刻
+                    key_start = f"{date_str}:{schedule.id}:start:{now_hm}"
+                    if schedule.start_time == now_hm and key_start not in self.alarm_fired_today:
+                        try:
+                            self._play_sound_schedule_start()
+                        except Exception:
+                            pass
+                        self.alarm_fired_today.add(key_start)
+
+                    # 終了時刻
+                    key_end = f"{date_str}:{schedule.id}:end:{now_hm}"
+                    if schedule.end_time == now_hm and key_end not in self.alarm_fired_today:
+                        try:
+                            self._play_sound_schedule_end()
+                        except Exception:
+                            pass
+                        self.alarm_fired_today.add(key_end)
+
     def on_item_double_clicked(self, item):
         """リストアイテムのダブルクリックハンドラ"""
         schedule = self.schedules[self.schedule_list.row(item)]
@@ -1267,6 +1307,8 @@ class MainWindow(QMainWindow):
             self.update_schedule_list()
             self.timebar.schedules = self.schedules
             self.timebar.update()
+            # プロファイル変更時は当日の通知済みフラグをクリア
+            self.alarm_fired_today.clear()
 
     def closeEvent(self, event):
         """ウィンドウを閉じる際の処理"""
@@ -1487,6 +1529,28 @@ class MainWindow(QMainWindow):
             winsound.Beep(784, 200)
             winsound.Beep(659, 200)
             winsound.Beep(523, 300)
+        except Exception:
+            pass
+
+    # === 予定アラーム関連 ===
+    def on_alarm_toggled(self, checked):
+        self.alarm_enabled = checked
+
+    def _play_sound_schedule_start(self):
+        """予定の開始時の効果音"""
+        try:
+            winsound.Beep(880, 120)
+            winsound.Beep(1046, 160)
+            winsound.Beep(1318, 180)
+        except Exception:
+            pass
+
+    def _play_sound_schedule_end(self):
+        """予定の終了時の効果音"""
+        try:
+            winsound.Beep(659, 120)
+            winsound.Beep(523, 160)
+            winsound.Beep(440, 200)
         except Exception:
             pass
 
