@@ -967,9 +967,32 @@ class TimeBarWidget(QWidget):
                     painter.setPen(Qt.NoPen)
                     painter.drawRect(progress_rect)
         else:
-            # スケジュールが無い場合のメッセージ
+            # 予定がない時間帯 → 次の予定までの残り時間を表示
             painter.setPen(QPen(QColor("#666666")))
-            painter.drawText(status_rect, Qt.AlignCenter, "現在進行中のスケジュールはありません")
+            if self.schedules:
+                now_time = QTime.currentTime()
+                now_minutes = now_time.hour() * 60 + now_time.minute()
+
+                next_schedule = None
+                min_delta = None
+                for schedule in self.schedules:
+                    start = QTime.fromString(schedule.start_time, "HH:mm")
+                    start_minutes = start.hour() * 60 + start.minute()
+                    delta = start_minutes - now_minutes
+                    if delta <= 0:
+                        delta += 24 * 60
+                    if (min_delta is None) or (delta < min_delta):
+                        min_delta = delta
+                        next_schedule = schedule
+
+                if next_schedule and min_delta is not None:
+                    remaining_text = self._format_time(min_delta)
+                    text = f"次の予定: [ {next_schedule.name} ]  {next_schedule.start_time} 開始  ➡  残り {remaining_text}"
+                    painter.drawText(status_rect, Qt.AlignCenter, text)
+                else:
+                    painter.drawText(status_rect, Qt.AlignCenter, "現在進行中のスケジュールはありません")
+            else:
+                painter.drawText(status_rect, Qt.AlignCenter, "現在進行中のスケジュールはありません")
 
 
 class DatabaseViewer(QDialog):
