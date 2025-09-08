@@ -1101,6 +1101,15 @@ class MainWindow(QMainWindow):
         self.pomodoro_pause_button.clicked.connect(self.on_pomodoro_pause_resume)
         time_layout.addWidget(self.pomodoro_pause_button)
         
+        # 休憩表示用ラベル（休憩中のみ表示）
+        self.break_label = QLabel()
+        self.break_label.setVisible(False)
+        self.break_label.setStyleSheet(
+            "color: #b71c1c; background-color: #FFF3CD;"
+            "border: 1px solid #f5c2c7; padding: 2px 8px; font-weight: bold;"
+        )
+        time_layout.addWidget(self.break_label)
+        
         # タイムバー
         self.timebar = TimeBarWidget(self.start_time, self.schedules)
         layout.addWidget(self.timebar)
@@ -1122,6 +1131,9 @@ class MainWindow(QMainWindow):
         self.break_close_timer.setSingleShot(True)
         self.break_close_timer.timeout.connect(self.on_break_end)
         self.break_dialog = None
+        # 休憩状態管理
+        self.in_break = False
+        self.break_end_dt = None
 
         # 予定アラーム用の状態
         self.alarm_enabled = False
@@ -1254,9 +1266,21 @@ class MainWindow(QMainWindow):
             self.pomodoro_elapsed_label.setText(f"経過: {int(elapsed_min)} 分")
             # 進捗バー更新（秒単位）
             self.pomodoro_progress.setValue(int(current_elapsed_ms // 1000))
-            # 25分に到達したら手動チェック（タイマーが停止時でも検出）
-            if current_elapsed_ms >= 25 * 60 * 1000 and self.break_dialog is None:
+            # 25分に到達したら手動チェック（休憩中でない場合のみ）
+            if current_elapsed_ms >= 25 * 60 * 1000 and not self.in_break:
                 self.on_pomodoro_25min()
+
+        # 休憩中の表示更新（残り時間カウントダウン）
+        if self.in_break and self.break_end_dt is not None:
+            remaining_secs = QDateTime.currentDateTime().secsTo(self.break_end_dt)
+            if remaining_secs < 0:
+                remaining_secs = 0
+            mm = remaining_secs // 60
+            ss = remaining_secs % 60
+            self.break_label.setText(f"休憩中 ⏳ 残り {mm:02d}:{ss:02d}")
+            self.break_label.setVisible(True)
+        else:
+            self.break_label.setVisible(False)
 
         # 予定アラーム（開始・終了の通知音）
         if self.alarm_enabled:
@@ -1450,6 +1474,10 @@ class MainWindow(QMainWindow):
             self.pomodoro_timer_25.start(25 * 60 * 1000)
             # スタート効果音
             self._play_sound_start()
+            # 休憩状態初期化
+            self.in_break = False
+            self.break_end_dt = None
+            self.break_label.setVisible(False)
         else:
             self.pomodoro_timer_25.stop()
             self._close_break_dialog_if_needed()
@@ -1458,12 +1486,23 @@ class MainWindow(QMainWindow):
             self.pomodoro_paused = False
             # 停止効果音
             self._play_sound_stop()
+            # 休憩状態クリア
+            self.in_break = False
+            self.break_end_dt = None
+            self.break_label.setVisible(False)
 
     def on_pomodoro_25min(self):
         if not self.pomodoro_running:
             return
-        # 作業終了→5分休憩開始ダイアログ
-        self._show_break_dialog()
+        # 作業終了→5分休憩開始（ダイアログなし、行内ラベルで表示）
+        self.in_break = True
+        self.break_end_dt = QDateTime.currentDateTime().addSecs(5 * 60)
+        self.break_label.setVisible(True)
+        # 作業タイマーは停止状態に（経過時間は保持）
+        if self.pomodoro_start_dt is not None:
+            self.pomodoro_accumulated_ms += self.pomodoro_start_dt.msecsTo(QDateTime.currentDateTime())
+        self.pomodoro_start_dt = None
+        self.pomodoro_paused = True
         # 5分後に自動クローズ
         self.break_close_timer.start(5 * 60 * 1000)
         # 25分経過効果音
@@ -1512,9 +1551,21 @@ class MainWindow(QMainWindow):
         # 休憩終了効果音
         self._play_sound_break_end()
         self._close_break_dialog_if_needed()
-        # 自動的にトグルをOFFに戻す（1サイクル）
+        # 休憩表示をクリア
+        self.in_break = False
+        self.break_end_dt = None
+        self.break_label.setVisible(False)
+        # スイッチがONの場合は次の25分作業サイクルを自動開始
         if self.pomodoro_switch.isChecked():
-            self.pomodoro_switch.setChecked(False)
+            self.pomodoro_paused = False
+            self.pomodoro_accumulated_ms = 0
+            self.pomodoro_start_dt = QDateTime.currentDateTime()
+            self.pomodoro_elapsed_label.setText("経過: 0 分")
+            self.pomodoro_progress.setValue(0)
+            self.pomodoro_pause_button.setText("一時停止")
+            self.pomodoro_timer_25.start(25 * 60 * 1000)
+            # 次サイクル開始効果音
+            self._play_sound_start()
 
     def _close_break_dialog_if_needed(self):
         if self.break_dialog is not None:
