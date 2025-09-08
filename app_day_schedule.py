@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QListView
 )
 from PySide6.QtCore import Qt, QTime, QRect, QTimer, QDateTime
-from PySide6.QtGui import QPainter, QColor, QBrush, QPen, QFont
+from PySide6.QtGui import QPainter, QColor, QBrush, QPen, QFont, QTransform, QPixmap
 import winsound
 
 # 定数定義
@@ -241,6 +241,25 @@ def get_complementary_color(hex_color):
         return QColor(0, 0, 0)  # 明るい背景には黒文字
     else:
         return QColor(255, 255, 255)  # 暗い背景には白文字
+
+
+def is_dark_mode_enabled():
+    """Windows のアプリテーマ設定がダークかを返す。
+
+    AppsUseLightTheme = 0 ならダーク、1 ならライト。
+    取得できない場合は False（ライト扱い）。
+    """
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        )
+        value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        winreg.CloseKey(key)
+        return value == 0
+    except Exception:
+        return False
 
 
 class Schedule:
@@ -817,8 +836,43 @@ class TimeBarWidget(QWidget):
     def _draw_bar_background(self, painter):
         """バーの背景描画"""
         background_rect = QRect(0, 40, self.width(), BAR_HEIGHT)
-        painter.setBrush(QBrush(QColor("#FFFFFF")))
+
+        # ベース（白）
+        painter.fillRect(background_rect, QColor("#FFFFFF"))
+
+        # 予定が無い時間帯に見えるよう、全体へ薄い斜めストライプを敷く
+        painter.save()
+        # タイル敷き詰めはDPIスケーリングで粒状化しやすいため、
+        # 直接等間隔の斜線を描画して一様な見た目にする
+        painter.setClipRect(background_rect)
+        pen = QPen(QColor(180, 180, 180))
+        pen.setWidth(1)
+        pen.setCosmetic(True)  # デバイスピクセル基準で一定幅
+        pen.setCapStyle(Qt.FlatCap)
+        painter.setPen(pen)
+        spacing = 7  # ストライプ間隔(px)
+        left = background_rect.left()
+        right = background_rect.right()
+        top = background_rect.top()
+        bottom = background_rect.bottom()
+        height = background_rect.height()
+
+        # 左端の外側から右端まで45°の対角線を等間隔で描画
+        start = -height
+        end = right - left
+        x = start
+        while x <= end:
+            x1 = left + x
+            y1 = bottom
+            x2 = x1 + height
+            y2 = top
+            painter.drawLine(x1, y1, x2, y2)
+            x += spacing
+        painter.restore()
+
+        # 外枠
         painter.setPen(QPen(QColor("#cccccc")))
+        painter.setBrush(Qt.NoBrush)
         painter.drawRect(background_rect)
 
     def _draw_schedules(self, painter):
@@ -977,10 +1031,27 @@ class TimeBarWidget(QWidget):
         now = QTime.currentTime()
         status_y = BAR_HEIGHT + 50  # ステータスセクションのY位置
         
+        # テーマ別カラー設定
+        dark = is_dark_mode_enabled()
+        if dark:
+            status_bg = QColor("#1e1e1e")
+            status_border = QColor("#444444")
+            text_main = QColor("#e0e0e0")
+            text_muted = QColor("#bbbbbb")
+            bar_bg = QColor("#333333")
+            bar_border = QColor("#555555")
+        else:
+            status_bg = QColor("#f5f5f5")
+            status_border = QColor("#cccccc")
+            text_main = QColor("#000000")
+            text_muted = QColor("#666666")
+            bar_bg = QColor("#e0e0e0")
+            bar_border = QColor("#cccccc")
+
         # ステータス背景の描画
         status_rect = QRect(0, status_y, self.width(), self.status_height)
-        painter.setPen(QPen(QColor("#cccccc")))
-        painter.setBrush(QBrush(QColor("#f5f5f5")))
+        painter.setPen(QPen(status_border))
+        painter.setBrush(QBrush(status_bg))
         painter.drawRect(status_rect)
         
         # 現在進行中のスケジュールを探す
@@ -1006,7 +1077,7 @@ class TimeBarWidget(QWidget):
                 
                 # テキストを描画
                 painter.setFont(QFont("Arial", 10))
-                painter.setPen(QPen(QColor("#000000")))
+                painter.setPen(QPen(text_main))
                 painter.drawText(text_rect, Qt.AlignCenter, combined_text)
                 
                 # プログレスバーの描画
@@ -1015,8 +1086,8 @@ class TimeBarWidget(QWidget):
                 
                 # プログレスバーの背景
                 bar_rect = QRect(int(x) + 10, status_y + 30, int(schedule_width) - 20, 6)
-                painter.setBrush(QBrush(QColor("#e0e0e0")))
-                painter.setPen(QPen(QColor("#cccccc")))
+                painter.setBrush(QBrush(bar_bg))
+                painter.setPen(QPen(bar_border))
                 painter.drawRect(bar_rect)
                 
                 # プログレスバーの進捗
@@ -1050,11 +1121,11 @@ class TimeBarWidget(QWidget):
                 label = next_alarm.label if next_alarm.label else "アラーム"
                 remaining_alarm_text = self._format_time(min_alarm_delta)
                 sub_rect = QRect(5, status_y + 40, self.width() - 10, 16)
-                painter.setPen(QPen(QColor("#333333")))
+                painter.setPen(QPen(text_muted))
                 painter.drawText(sub_rect, Qt.AlignCenter, f"次のフリーアラーム: [ {label} ] {next_alarm.time_text} ➡ 残り {remaining_alarm_text}")
         else:
             # 予定がない時間帯 → 次の予定やフリーアラームまでの残り時間を表示
-            painter.setPen(QPen(QColor("#666666")))
+            painter.setPen(QPen(text_muted))
             if self.schedules:
                 now_time = QTime.currentTime()
                 now_minutes = now_time.hour() * 60 + now_time.minute()
