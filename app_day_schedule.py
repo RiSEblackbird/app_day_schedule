@@ -12,7 +12,8 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTimeEdit, QListWidget, QDialog,
     QLineEdit, QListWidgetItem, QComboBox, QInputDialog, QMessageBox,
-    QTableWidget, QTableWidgetItem, QToolTip, QCheckBox, QProgressBar
+    QTableWidget, QTableWidgetItem, QToolTip, QCheckBox, QProgressBar,
+    QListView
 )
 from PySide6.QtCore import Qt, QTime, QRect, QTimer, QDateTime
 from PySide6.QtGui import QPainter, QColor, QBrush, QPen, QFont
@@ -175,6 +176,16 @@ def init_db():
         
         # デフォルト値が存在しない場合は挿入
         c.execute('INSERT OR IGNORE INTO last_profile (id, profile_id) VALUES (1, 1)')
+
+        # フリーアラームテーブル（プロファイル非依存）
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS free_alarms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                time_text TEXT,
+                label TEXT,
+                enabled INTEGER DEFAULT 1
+            )
+        ''')
         
         conn.commit()
     except sqlite3.Error as e:
@@ -299,6 +310,56 @@ class Schedule:
         start_minutes = start.hour() * 60 + start.minute()
         end_minutes = end.hour() * 60 + end.minute()
         return start_minutes, end_minutes
+
+
+class FreeAlarm:
+    """プロファイルに依存しないフリーアラーム"""
+    def __init__(self, time_text, label="", enabled=True, id=None):
+        self.id = id
+        self.time_text = time_text  # "HH:mm"
+        self.label = label
+        self.enabled = bool(enabled)
+
+    def save_to_db(self):
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        if self.id is None:
+            c.execute(
+                'INSERT INTO free_alarms (time_text, label, enabled) VALUES (?, ?, ?)',
+                (self.time_text, self.label, 1 if self.enabled else 0)
+            )
+            self.id = c.lastrowid
+        else:
+            c.execute(
+                'UPDATE free_alarms SET time_text=?, label=?, enabled=? WHERE id=?',
+                (self.time_text, self.label, 1 if self.enabled else 0, self.id)
+            )
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def delete_from_db(id):
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute('DELETE FROM free_alarms WHERE id=?', (id,))
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def load_all_from_db():
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute('SELECT id, time_text, label, enabled FROM free_alarms')
+        alarms = []
+        for row in c.fetchall():
+            alarms.append(FreeAlarm(row[1], row[2], bool(row[3]), row[0]))
+        conn.close()
+        # 時刻順に並べ替え
+        def to_minutes(hhmm:str):
+            t = QTime.fromString(hhmm, "HH:mm")
+            return t.hour()*60 + t.minute()
+        alarms.sort(key=lambda a: to_minutes(a.time_text))
+        return alarms
 
 
 class Profile:
@@ -551,7 +612,7 @@ class TimeBarWidget(QWidget):
         super().__init__(parent)
         self.start_time = start_time
         self.schedules = schedules
-        self.status_height = 40
+        self.status_height = 60
         self.setMinimumHeight(BAR_HEIGHT + 60 + self.status_height)
         self.highlight_time = QTime.fromString(start_time, "HH:mm")
         
@@ -966,8 +1027,33 @@ class TimeBarWidget(QWidget):
                     painter.setBrush(QBrush(QColor(schedule.color)))
                     painter.setPen(Qt.NoPen)
                     painter.drawRect(progress_rect)
+            # 下段に「次のフリーアラーム」を併記
+            try:
+                alarms = FreeAlarm.load_all_from_db()
+            except Exception:
+                alarms = []
+            now_minutes = QTime.currentTime().hour()*60 + QTime.currentTime().minute()
+            next_alarm = None
+            min_alarm_delta = None
+            for alarm in alarms:
+                if not alarm.enabled:
+                    continue
+                t = QTime.fromString(alarm.time_text, "HH:mm")
+                tmin = t.hour()*60 + t.minute()
+                delta = tmin - now_minutes
+                if delta <= 0:
+                    delta += 24*60
+                if (min_alarm_delta is None) or (delta < min_alarm_delta):
+                    min_alarm_delta = delta
+                    next_alarm = alarm
+            if next_alarm is not None:
+                label = next_alarm.label if next_alarm.label else "アラーム"
+                remaining_alarm_text = self._format_time(min_alarm_delta)
+                sub_rect = QRect(5, status_y + 40, self.width() - 10, 16)
+                painter.setPen(QPen(QColor("#333333")))
+                painter.drawText(sub_rect, Qt.AlignCenter, f"次のフリーアラーム: [ {label} ] {next_alarm.time_text} ➡ 残り {remaining_alarm_text}")
         else:
-            # 予定がない時間帯 → 次の予定までの残り時間を表示
+            # 予定がない時間帯 → 次の予定やフリーアラームまでの残り時間を表示
             painter.setPen(QPen(QColor("#666666")))
             if self.schedules:
                 now_time = QTime.currentTime()
@@ -985,14 +1071,65 @@ class TimeBarWidget(QWidget):
                         min_delta = delta
                         next_schedule = schedule
 
+                # ここでフリーアラームの最短も比較
+                try:
+                    alarms = FreeAlarm.load_all_from_db()
+                except Exception:
+                    alarms = []
+                next_alarm = None
+                min_alarm_delta = None
+                for alarm in alarms:
+                    if not alarm.enabled:
+                        continue
+                    t = QTime.fromString(alarm.time_text, "HH:mm")
+                    tmin = t.hour() * 60 + t.minute()
+                    delta = tmin - now_minutes
+                    if delta <= 0:
+                        delta += 24 * 60
+                    if (min_alarm_delta is None) or (delta < min_alarm_delta):
+                        min_alarm_delta = delta
+                        next_alarm = alarm
+
+                # 表示メッセージ組み立て
+                messages = []
                 if next_schedule and min_delta is not None:
                     remaining_text = self._format_time(min_delta)
-                    text = f"次の予定: [ {next_schedule.name} ]  {next_schedule.start_time} 開始  ➡  残り {remaining_text}"
-                    painter.drawText(status_rect, Qt.AlignCenter, text)
+                    messages.append(f"次の予定: [ {next_schedule.name} ] {next_schedule.start_time} ➡ 残り {remaining_text}")
+                if next_alarm and min_alarm_delta is not None:
+                    remaining_alarm_text = self._format_time(min_alarm_delta)
+                    label = next_alarm.label if next_alarm.label else "アラーム"
+                    messages.append(f"次のフリーアラーム: [ {label} ] {next_alarm.time_text} ➡ 残り {remaining_alarm_text}")
+
+                if messages:
+                    painter.drawText(status_rect, Qt.AlignCenter, "   ｜   ".join(messages))
                 else:
                     painter.drawText(status_rect, Qt.AlignCenter, "現在進行中のスケジュールはありません")
             else:
-                painter.drawText(status_rect, Qt.AlignCenter, "現在進行中のスケジュールはありません")
+                # スケジュールが全くない場合でもフリーアラームがあれば表示
+                try:
+                    alarms = FreeAlarm.load_all_from_db()
+                except Exception:
+                    alarms = []
+                now_minutes = QTime.currentTime().hour()*60 + QTime.currentTime().minute()
+                next_alarm = None
+                min_alarm_delta = None
+                for alarm in alarms:
+                    if not alarm.enabled:
+                        continue
+                    t = QTime.fromString(alarm.time_text, "HH:mm")
+                    tmin = t.hour()*60 + t.minute()
+                    delta = tmin - now_minutes
+                    if delta <= 0:
+                        delta += 24*60
+                    if (min_alarm_delta is None) or (delta < min_alarm_delta):
+                        min_alarm_delta = delta
+                        next_alarm = alarm
+                if next_alarm:
+                    remaining_alarm_text = self._format_time(min_alarm_delta)
+                    label = next_alarm.label if next_alarm.label else "アラーム"
+                    painter.drawText(status_rect, Qt.AlignCenter, f"次のフリーアラーム: [ {label} ] {next_alarm.time_text} ➡ 残り {remaining_alarm_text}")
+                else:
+                    painter.drawText(status_rect, Qt.AlignCenter, "現在進行中のスケジュールはありません")
 
 
 class DatabaseViewer(QDialog):
@@ -1027,6 +1164,129 @@ class DatabaseViewer(QDialog):
                 self.table_widget.setItem(row_index, column_index, QTableWidgetItem(str(data)))
 
         conn.close()
+
+
+class FreeAlarmItemWidget(QWidget):
+    """フリーアラーム一覧の1行（時刻・ラベル・有効トグル）"""
+    def __init__(self, alarm: FreeAlarm, parent=None):
+        super().__init__(parent)
+        self.alarm = alarm
+        h = QHBoxLayout(self)
+        h.setContentsMargins(6, 2, 6, 2)
+        self.label = QLabel(f"{alarm.time_text}  {alarm.label}")
+        h.addWidget(self.label)
+        h.addStretch()
+        self.toggle = QCheckBox()
+        self.toggle.setChecked(alarm.enabled)
+        self.toggle.toggled.connect(self.on_toggled)
+        h.addWidget(self.toggle)
+
+    def on_toggled(self, checked):
+        self.alarm.enabled = checked
+        self.alarm.save_to_db()
+
+
+class FreeAlarmEditDialog(QDialog):
+    """アラームの追加/編集用ダイアログ"""
+    def __init__(self, parent=None, alarm: FreeAlarm=None):
+        super().__init__(parent)
+        self.setWindowTitle("アラーム追加" if alarm is None else "アラーム編集")
+        self.alarm = alarm
+        v = QVBoxLayout(self)
+        form = QHBoxLayout()
+        left = QVBoxLayout()
+        right = QVBoxLayout()
+        left.addWidget(QLabel("時刻:"))
+        self.time_edit = QTimeEdit()
+        self.time_edit.setDisplayFormat("HH:mm")
+        left.addWidget(self.time_edit)
+        right.addWidget(QLabel("概要:"))
+        self.label_edit = QLineEdit()
+        right.addWidget(self.label_edit)
+        form.addLayout(left)
+        form.addLayout(right)
+        v.addLayout(form)
+        btns = QHBoxLayout()
+        ok = QPushButton("保存")
+        ok.clicked.connect(self.accept)
+        btns.addWidget(ok)
+        v.addLayout(btns)
+        if alarm is not None:
+            self.time_edit.setTime(QTime.fromString(alarm.time_text, "HH:mm"))
+            self.label_edit.setText(alarm.label)
+
+    def get_data(self):
+        return {
+            'time_text': self.time_edit.time().toString("HH:mm"),
+            'label': self.label_edit.text().strip(),
+        }
+
+
+class FreeAlarmDialog(QDialog):
+    """フリーアラームの管理ダイアログ（一覧・追加・編集・削除）"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("フリーアラーム")
+        v = QVBoxLayout(self)
+        self.list_widget = QListWidget()
+        v.addWidget(self.list_widget)
+        self.refresh_list()
+
+        btns = QHBoxLayout()
+        add_btn = QPushButton("追加")
+        edit_btn = QPushButton("編集")
+        del_btn = QPushButton("削除")
+        close_btn = QPushButton("閉じる")
+        add_btn.clicked.connect(self.on_add)
+        edit_btn.clicked.connect(self.on_edit)
+        del_btn.clicked.connect(self.on_delete)
+        close_btn.clicked.connect(self.accept)
+        for b in (add_btn, edit_btn, del_btn, close_btn):
+            btns.addWidget(b)
+        v.addLayout(btns)
+
+    def refresh_list(self):
+        self.list_widget.clear()
+        self.alarms = FreeAlarm.load_all_from_db()
+        for alarm in self.alarms:
+            item = QListWidgetItem(self.list_widget)
+            w = FreeAlarmItemWidget(alarm, self)
+            item.setSizeHint(w.sizeHint())
+            self.list_widget.setItemWidget(item, w)
+
+    def _current_alarm(self):
+        item = self.list_widget.currentItem()
+        if not item:
+            return None
+        idx = self.list_widget.row(item)
+        return self.alarms[idx]
+
+    def on_add(self):
+        dlg = FreeAlarmEditDialog(self)
+        if dlg.exec():
+            data = dlg.get_data()
+            alarm = FreeAlarm(data['time_text'], data['label'], True)
+            alarm.save_to_db()
+            self.refresh_list()
+
+    def on_edit(self):
+        alarm = self._current_alarm()
+        if not alarm:
+            return
+        dlg = FreeAlarmEditDialog(self, alarm)
+        if dlg.exec():
+            data = dlg.get_data()
+            alarm.time_text = data['time_text']
+            alarm.label = data['label']
+            alarm.save_to_db()
+            self.refresh_list()
+
+    def on_delete(self):
+        alarm = self._current_alarm()
+        if not alarm:
+            return
+        FreeAlarm.delete_from_db(alarm.id)
+        self.refresh_list()
 
 
 class MainWindow(QMainWindow):
@@ -1081,6 +1341,10 @@ class MainWindow(QMainWindow):
         self.alarm_switch.setChecked(False)
         self.alarm_switch.toggled.connect(self.on_alarm_toggled)
         time_layout.addWidget(self.alarm_switch)
+        try:
+            print(f"[ALARM DEBUG] initial alarm_enabled={self.alarm_switch.isChecked()}")
+        except Exception:
+            pass
         
         self.pomodoro_elapsed_label = QLabel()
         self.pomodoro_elapsed_label.setStyleSheet("font-size: 12px; color: #555;")
@@ -1139,6 +1403,8 @@ class MainWindow(QMainWindow):
         self.alarm_enabled = False
         self.alarm_fired_today = set()
         self.alarm_date_str = QDateTime.currentDateTime().toString("yyyy-MM-dd")
+        # 分変化の検出用（取りこぼし防止）
+        self.last_alarm_check_minute = QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm")
 
         # 初回の時刻表示
         self.update_clock()
@@ -1165,6 +1431,11 @@ class MainWindow(QMainWindow):
         manage_profile_button = QPushButton("プロファイル管理")
         manage_profile_button.clicked.connect(self.manage_profiles)
         profile_layout.addWidget(manage_profile_button)
+
+        # フリーアラーム管理ボタン（プロファイル管理の右隣）
+        free_alarm_button = QPushButton("フリーアラーム")
+        free_alarm_button.clicked.connect(self.manage_free_alarms)
+        profile_layout.addWidget(free_alarm_button)
 
         # DB確認ボタンを追加
         db_view_button = QPushButton("DB確認")
@@ -1282,35 +1553,81 @@ class MainWindow(QMainWindow):
         else:
             self.break_label.setVisible(False)
 
-        # 予定アラーム（開始・終了の通知音）
-        if self.alarm_enabled:
-            date_str = current.toString("yyyy-MM-dd")
-            if date_str != self.alarm_date_str:
-                # 日付が変わったら当日の通知済みフラグをリセット
-                self.alarm_date_str = date_str
-                self.alarm_fired_today.clear()
+        # アラーム（予定/フリー）判定
+        date_str = current.toString("yyyy-MM-dd")
+        if date_str != self.alarm_date_str:
+            # 日付が変わったら当日の通知済みフラグをリセット
+            self.alarm_date_str = date_str
+            self.alarm_fired_today.clear()
+            # 分チェック基準も日付付きで更新
+            self.last_alarm_check_minute = current.toString("yyyy-MM-dd HH:mm")
 
-            # 1分境界（秒=0）の時だけチェックして重複を防止
-            if current.time().second() == 0:
-                now_hm = current.toString("HH:mm")
-                for schedule in list(self.schedules):
-                    # 開始時刻
-                    key_start = f"{date_str}:{schedule.id}:start:{now_hm}"
-                    if schedule.start_time == now_hm and key_start not in self.alarm_fired_today:
+        # 分の変化を検出して判定を行う（秒=0に依存しない）
+        current_minute_key = current.toString("yyyy-MM-dd HH:mm")
+        if current_minute_key != self.last_alarm_check_minute:
+            # 最後にチェックした分+1分から現在までの各分を順にチェック（取りこぼし補償）
+            try:
+                start_dt = QDateTime.fromString(self.last_alarm_check_minute, "yyyy-MM-dd HH:mm")
+            except Exception:
+                start_dt = current
+            if not start_dt.isValid():
+                start_dt = current
+            # 直後の分から始める
+            iter_dt = start_dt.addSecs(60)
+            max_steps = 24 * 60  # 安全上限
+            step = 0
+            try:
+                alarms = FreeAlarm.load_all_from_db()
+                print(f"[ALARM DEBUG] free alarms loaded: {len(alarms)}")
+            except Exception as e:
+                print(f"[ALARM DEBUG] failed to load free alarms: {e}")
+                alarms = []
+            while iter_dt <= current and step < max_steps:
+                step += 1
+                iter_date_str = iter_dt.toString("yyyy-MM-dd")
+                iter_hm = iter_dt.toString("HH:mm")
+                try:
+                    print(f"[ALARM DEBUG] minute tick: {iter_dt.toString('yyyy-MM-dd HH:mm')}")
+                except Exception:
+                    pass
+                # 予定（開始/終了）はトグルに従う
+                if self.alarm_enabled:
+                    for schedule in list(self.schedules):
+                        key_start = f"{iter_date_str}:{schedule.id}:start:{iter_hm}"
+                        if schedule.start_time == iter_hm and key_start not in self.alarm_fired_today:
+                            try:
+                                self._play_sound_schedule_start()
+                                print(f"[ALARM DEBUG] schedule start fired: id={schedule.id} time={iter_hm} name={schedule.name}")
+                            except Exception:
+                                pass
+                            self.alarm_fired_today.add(key_start)
+
+                        key_end = f"{iter_date_str}:{schedule.id}:end:{iter_hm}"
+                        if schedule.end_time == iter_hm and key_end not in self.alarm_fired_today:
+                            try:
+                                self._play_sound_schedule_end()
+                                print(f"[ALARM DEBUG] schedule end fired: id={schedule.id} time={iter_hm} name={schedule.name}")
+                            except Exception:
+                                pass
+                            self.alarm_fired_today.add(key_end)
+
+                # フリーアラームは常時（各アラームのenabledに従う）
+                for alarm in alarms:
+                    if not alarm.enabled:
+                        continue
+                    key_free = f"{iter_date_str}:free:{alarm.id}:{iter_hm}"
+                    if alarm.time_text == iter_hm and key_free not in self.alarm_fired_today:
                         try:
                             self._play_sound_schedule_start()
-                        except Exception:
-                            pass
-                        self.alarm_fired_today.add(key_start)
+                            print(f"[ALARM DEBUG] free alarm fired: id={alarm.id} time={iter_hm} label={alarm.label}")
+                        except Exception as e:
+                            print(f"[ALARM DEBUG] free alarm sound error: {e}")
+                        self.alarm_fired_today.add(key_free)
 
-                    # 終了時刻
-                    key_end = f"{date_str}:{schedule.id}:end:{now_hm}"
-                    if schedule.end_time == now_hm and key_end not in self.alarm_fired_today:
-                        try:
-                            self._play_sound_schedule_end()
-                        except Exception:
-                            pass
-                        self.alarm_fired_today.add(key_end)
+                iter_dt = iter_dt.addSecs(60)
+
+            # 最後にチェックした分を更新
+            self.last_alarm_check_minute = current_minute_key
 
     def on_item_double_clicked(self, item):
         """リストアイテムのダブルクリックハンドラ"""
@@ -1368,6 +1685,15 @@ class MainWindow(QMainWindow):
         dialog = ProfileManageDialog(self)
         if dialog.exec():
             self.update_profile_combo()
+
+    # === フリーアラーム ===
+    def manage_free_alarms(self):
+        dialog = FreeAlarmDialog(self)
+        if dialog.exec():
+            # 変更反映のためにインジケーター更新
+            self.timebar.update()
+            # 予定アラームの重複防止キーをリセット
+            self.alarm_fired_today.clear()
 
     @debug_profile_operation("スケジュール追加")
     def add_schedule(self):
@@ -1609,6 +1935,10 @@ class MainWindow(QMainWindow):
     # === 予定アラーム関連 ===
     def on_alarm_toggled(self, checked):
         self.alarm_enabled = checked
+        try:
+            print(f"[ALARM DEBUG] alarm toggled -> {checked}")
+        except Exception:
+            pass
 
     def _play_sound_schedule_start(self):
         """予定の開始時の効果音"""
