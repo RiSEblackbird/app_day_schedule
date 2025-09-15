@@ -1529,6 +1529,11 @@ class MainWindow(QMainWindow):
         add_button = QPushButton("スケジュール追加")
         add_button.clicked.connect(self.add_schedule)
         button_layout.addWidget(add_button)
+        # 追加: 常に手前チェックボックス（追加ボタンの右側）
+        self.topmost_checkbox = QCheckBox("常に手前")
+        self.topmost_checkbox.setChecked(False)
+        self.topmost_checkbox.toggled.connect(self.on_topmost_toggled)
+        button_layout.addWidget(self.topmost_checkbox)
         button_layout.addStretch()
         layout.addLayout(button_layout)
         
@@ -1854,6 +1859,12 @@ class MainWindow(QMainWindow):
         """データベース内容を表示するダイアログを開く"""
         dialog = DatabaseViewer(self)
         dialog.exec()
+
+    # === 常に手前 ===
+    def on_topmost_toggled(self, checked):
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, bool(checked))
+        # 反映のため再表示
+        self.show()
 
     # === ポモドーロ関連 ===
     def on_pomodoro_toggled(self, checked):
