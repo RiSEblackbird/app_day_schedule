@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QTimeEdit, QListWidget, QDialog,
     QLineEdit, QListWidgetItem, QComboBox, QInputDialog, QMessageBox,
     QTableWidget, QTableWidgetItem, QToolTip, QCheckBox, QProgressBar,
-    QListView
+    QListView, QTabWidget,
 )
 from PySide6.QtCore import Qt, QTime, QRect, QTimer, QDateTime
 from PySide6.QtGui import QPainter, QColor, QBrush, QPen, QFont, QTransform, QPixmap
@@ -22,7 +22,7 @@ import winsound
 # 定数定義
 WINDOW_TITLE = "1日のスケジュール設計"
 WINDOW_WIDTH = 1200  # 横幅を広げて24時間を見やすく
-WINDOW_HEIGHT = 300
+WINDOW_HEIGHT = 400
 DEFAULT_START_TIME = "08:00"
 BAR_HEIGHT = 100
 HOUR_WIDTH = 45  # 時間軸の幅を調整
@@ -184,6 +184,18 @@ def init_db():
                 time_text TEXT,
                 label TEXT,
                 enabled INTEGER DEFAULT 1
+            )
+        ''')
+
+        # インスタント予定（プロファイル非依存・表示フラグでタイムバーと予定アラームを連動）
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS instant_schedules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                start_time TEXT,
+                end_time TEXT,
+                color TEXT,
+                visible INTEGER DEFAULT 1
             )
         ''')
         
@@ -379,6 +391,86 @@ class FreeAlarm:
             return t.hour()*60 + t.minute()
         alarms.sort(key=lambda a: to_minutes(a.time_text))
         return alarms
+
+
+class InstantSchedule:
+    """プロファイルに紐づかないインスタント予定。
+
+    visible が True のときのみタイムライン描画・ステータス・予定アラームの対象になる。
+    """
+
+    def __init__(self, name, start_time, end_time, color, id=None, visible=True):
+        self.id = id
+        self.name = name
+        self.start_time = start_time
+        self.end_time = end_time
+        self.color = color
+        self.visible = bool(visible)
+
+    def save_to_db(self):
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        vis = 1 if self.visible else 0
+        if self.id is None:
+            c.execute(
+                '''
+                INSERT INTO instant_schedules (name, start_time, end_time, color, visible)
+                VALUES (?, ?, ?, ?, ?)
+                ''',
+                (self.name, self.start_time, self.end_time, self.color, vis),
+            )
+            self.id = c.lastrowid
+        else:
+            c.execute(
+                '''
+                UPDATE instant_schedules
+                SET name=?, start_time=?, end_time=?, color=?, visible=?
+                WHERE id=?
+                ''',
+                (self.name, self.start_time, self.end_time, self.color, vis, self.id),
+            )
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def delete_from_db(id):
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute('DELETE FROM instant_schedules WHERE id=?', (id,))
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def load_all_from_db():
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute(
+            'SELECT id, name, start_time, end_time, color, visible FROM instant_schedules'
+        )
+        rows = c.fetchall()
+        conn.close()
+        items = []
+        for row in rows:
+            items.append(
+                InstantSchedule(
+                    row[1], row[2], row[3], row[4], row[0], bool(row[5])
+                )
+            )
+
+        def to_minutes(hhmm: str):
+            t = QTime.fromString(hhmm, "HH:mm")
+            return t.hour() * 60 + t.minute()
+
+        items.sort(key=lambda s: to_minutes(s.start_time))
+        return items
+
+    def get_minutes(self):
+        """開始時刻と終了時刻を分単位で返す（Schedule と同じ契約）。"""
+        start = QTime.fromString(self.start_time, "HH:mm")
+        end = QTime.fromString(self.end_time, "HH:mm")
+        start_minutes = start.hour() * 60 + start.minute()
+        end_minutes = end.hour() * 60 + end.minute()
+        return start_minutes, end_minutes
 
 
 class Profile:
@@ -623,6 +715,120 @@ class ScheduleListItem(QWidget):
     def delete_clicked(self):
         """削除ボタンのクリックハンドラ"""
         self.main_window.delete_schedule(self.schedule)
+
+
+class AddInstantScheduleDialog(QDialog):
+    """インスタント予定の追加・編集（プロファイル選択なし）。"""
+
+    def __init__(self, parent=None, schedule=None):
+        super().__init__(parent)
+        self.setWindowTitle("インスタント予定の追加" if schedule is None else "インスタント予定の編集")
+        layout = QVBoxLayout()
+        form_layout = QHBoxLayout()
+        left_layout = QVBoxLayout()
+        self.name_edit = QLineEdit()
+        left_layout.addWidget(QLabel("予定名:"))
+        left_layout.addWidget(self.name_edit)
+        self.color = COLORS[0]
+        self.color_button = QPushButton("色を選択")
+        self.color_button.clicked.connect(self.choose_color)
+        left_layout.addWidget(self.color_button)
+        form_layout.addLayout(left_layout)
+        right_layout = QVBoxLayout()
+        self.start_time_edit = TimeSelectEdit()
+        right_layout.addWidget(QLabel("開始時刻:"))
+        right_layout.addWidget(self.start_time_edit)
+        self.end_time_edit = TimeSelectEdit()
+        right_layout.addWidget(QLabel("終了時刻:"))
+        right_layout.addWidget(self.end_time_edit)
+        form_layout.addLayout(right_layout)
+        layout.addLayout(form_layout)
+        button_layout = QHBoxLayout()
+        confirm_button = QPushButton("保存")
+        confirm_button.clicked.connect(self.accept)
+        button_layout.addWidget(confirm_button)
+        if schedule is not None:
+            delete_button = QPushButton("削除")
+            delete_button.clicked.connect(self.delete_schedule)
+            button_layout.addWidget(delete_button)
+        layout.addLayout(button_layout)
+        self.setLayout(layout)
+        if schedule is not None:
+            self.schedule = schedule
+            self.name_edit.setText(schedule.name)
+            self.start_time_edit.setTime(QTime.fromString(schedule.start_time, "HH:mm"))
+            self.end_time_edit.setTime(QTime.fromString(schedule.end_time, "HH:mm"))
+            self.color = schedule.color
+            self.color_button.setStyleSheet(f"background-color: {self.color}")
+
+    def delete_schedule(self):
+        self.done(2)
+
+    def choose_color(self):
+        from PySide6.QtWidgets import QColorDialog
+
+        current_color = QColor(self.color)
+        color = QColorDialog.getColor(
+            initial=current_color,
+            parent=self,
+            title="色を選択",
+            options=QColorDialog.ShowAlphaChannel,
+        )
+        if color.isValid():
+            self.color = color.name().upper()
+            self.color_button.setStyleSheet(f"background-color: {self.color}")
+
+    def get_data(self):
+        return {
+            "name": self.name_edit.text(),
+            "start_time": self.start_time_edit.time().toString("HH:mm"),
+            "end_time": self.end_time_edit.time().toString("HH:mm"),
+            "color": self.color,
+        }
+
+
+class InstantScheduleListItem(QWidget):
+    """インスタント予定一覧の1行（表示トグル・編集・削除）。"""
+
+    def __init__(self, instant: InstantSchedule, parent=None):
+        super().__init__(parent)
+        self.instant = instant
+        self.main_window = parent
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(5, 2, 5, 2)
+        self.visible_cb = QCheckBox()
+        self.visible_cb.setToolTip(
+            "オンでタイムバーに表示し、予定アラームの対象にします"
+        )
+        self.visible_cb.blockSignals(True)
+        self.visible_cb.setChecked(instant.visible)
+        self.visible_cb.blockSignals(False)
+        self.visible_cb.toggled.connect(self._on_visible_toggled)
+        layout.addWidget(self.visible_cb)
+        self.label = QLabel(
+            f"{instant.name} ({instant.start_time}-{instant.end_time})"
+        )
+        layout.addWidget(self.label)
+        layout.addStretch()
+        edit_button = QPushButton("編集")
+        edit_button.setFixedWidth(60)
+        edit_button.clicked.connect(self.edit_clicked)
+        layout.addWidget(edit_button)
+        delete_button = QPushButton("削除")
+        delete_button.setFixedWidth(60)
+        delete_button.clicked.connect(self.delete_clicked)
+        layout.addWidget(delete_button)
+
+    def _on_visible_toggled(self, checked):
+        self.instant.visible = bool(checked)
+        self.instant.save_to_db()
+        self.main_window.rebuild_timeline_schedules()
+
+    def edit_clicked(self):
+        self.main_window.edit_schedule(self.instant)
+
+    def delete_clicked(self):
+        self.main_window.delete_schedule(self.instant)
 
 
 class TimeBarWidget(QWidget):
@@ -1205,35 +1411,38 @@ class TimeBarWidget(QWidget):
 
 class DatabaseViewer(QDialog):
     """データベース内容を表示するダイアログ"""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("DB確認")
         self.setModal(True)
         layout = QVBoxLayout(self)
-
-        # テーブルウィジェットを追加
-        self.table_widget = QTableWidget()
-        layout.addWidget(self.table_widget)
-
-        # データベースの内容を読み込む
+        tabs = QTabWidget()
+        self.table_schedules = QTableWidget()
+        self.table_instant = QTableWidget()
+        tabs.addTab(self.table_schedules, "schedules")
+        tabs.addTab(self.table_instant, "instant_schedules")
+        layout.addWidget(tabs)
         self.load_database_content()
+
+    @staticmethod
+    def _fill_table(table: QTableWidget, c, sql: str):
+        c.execute(sql)
+        rows = c.fetchall()
+        column_names = [description[0] for description in c.description]
+        table.setRowCount(len(rows))
+        table.setColumnCount(len(column_names))
+        table.setHorizontalHeaderLabels(column_names)
+        for row_index, row_data in enumerate(rows):
+            for column_index, data in enumerate(row_data):
+                table.setItem(row_index, column_index, QTableWidgetItem(str(data)))
 
     def load_database_content(self):
         """データベースの内容をテーブルに読み込む"""
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        c.execute('SELECT * FROM schedules')
-        rows = c.fetchall()
-        column_names = [description[0] for description in c.description]
-
-        self.table_widget.setRowCount(len(rows))
-        self.table_widget.setColumnCount(len(column_names))
-        self.table_widget.setHorizontalHeaderLabels(column_names)
-
-        for row_index, row_data in enumerate(rows):
-            for column_index, data in enumerate(row_data):
-                self.table_widget.setItem(row_index, column_index, QTableWidgetItem(str(data)))
-
+        self._fill_table(self.table_schedules, c, "SELECT * FROM schedules")
+        self._fill_table(self.table_instant, c, "SELECT * FROM instant_schedules")
         conn.close()
 
 
@@ -1373,8 +1582,10 @@ class MainWindow(QMainWindow):
         # ウィンドウ位置の復元
         restore_position(self)
         
-        # 初期化
+        # 初期化（プロファイル予定とインスタント予定は別リスト。タイムバーは合成）
         self.schedules = Schedule.load_all_from_db(self.current_profile_id)
+        self.instant_schedules = InstantSchedule.load_all_from_db()
+        self._timeline_schedules = []
         self.start_time = DEFAULT_START_TIME
         
         # メインウィジェットとレイアウトの設定
@@ -1445,8 +1656,8 @@ class MainWindow(QMainWindow):
         )
         time_layout.addWidget(self.break_label)
         
-        # タイムバー
-        self.timebar = TimeBarWidget(self.start_time, self.schedules)
+        # タイムバー（表示内容は rebuild_timeline_schedules で合成リストを渡す）
+        self.timebar = TimeBarWidget(self.start_time, self._timeline_schedules)
         layout.addWidget(self.timebar)
         
         # タイマーの設定
@@ -1490,7 +1701,19 @@ class MainWindow(QMainWindow):
         # スケジュール一覧をレイアウトに追加
         layout.addWidget(QLabel("登録済みスケジュール（ダブルクリックで編集メニュー）:"))
         layout.addWidget(self.schedule_list)
-        
+
+        layout.addWidget(
+            QLabel(
+                "インスタント予定（プロファイル非依存・左のチェックで表示/非表示、予定アラームも連動）:"
+            )
+        )
+        self.instant_schedule_list = QListWidget()
+        self.instant_schedule_list.setMaximumHeight(80)
+        self.instant_schedule_list.itemDoubleClicked.connect(
+            self.on_instant_item_double_clicked
+        )
+        layout.addWidget(self.instant_schedule_list)
+
         # プロファイル選択コンボボックスを追加
         profile_layout = QHBoxLayout()
         self.profile_combo = QComboBox()
@@ -1522,13 +1745,18 @@ class MainWindow(QMainWindow):
         
         # 初期スケジュール読み込み
         self.schedules = Schedule.load_all_from_db(self.current_profile_id)  # プロファイルIDを指定
+        self.instant_schedules = InstantSchedule.load_all_from_db()
         self.update_schedule_list()
-        
+        self.update_instant_schedule_list()
+
         # ボタン
         button_layout = QHBoxLayout()
         add_button = QPushButton("スケジュール追加")
         add_button.clicked.connect(self.add_schedule)
         button_layout.addWidget(add_button)
+        add_instant_button = QPushButton("インスタント予定を追加")
+        add_instant_button.clicked.connect(self.add_instant_schedule)
+        button_layout.addWidget(add_instant_button)
         # 追加: 常に手前チェックボックス（追加ボタンの右側）
         self.topmost_checkbox = QCheckBox("常に手前")
         self.topmost_checkbox.setChecked(False)
@@ -1536,9 +1764,6 @@ class MainWindow(QMainWindow):
         button_layout.addWidget(self.topmost_checkbox)
         button_layout.addStretch()
         layout.addLayout(button_layout)
-        
-        # 既存のスケジュールをリストに表示
-        self.update_schedule_list()
 
     def load_last_profile_id(self):
         """最後に使用したプロファイルIDを読み込む"""
@@ -1589,6 +1814,13 @@ class MainWindow(QMainWindow):
         """ウィンドウが移動した時に位置を保存"""
         super().moveEvent(event)
         save_position(self)
+
+    def rebuild_timeline_schedules(self):
+        """プロファイル予定と、表示ONのインスタント予定を結合してタイムバー・ステータスに渡す。"""
+        visible_instants = [s for s in self.instant_schedules if s.visible]
+        self._timeline_schedules = self.schedules + visible_instants
+        self.timebar.schedules = self._timeline_schedules
+        self.timebar.update()
 
     def update_clock(self):
         """時計表示の更新"""
@@ -1666,10 +1898,10 @@ class MainWindow(QMainWindow):
                     print(f"[ALARM DEBUG] minute tick: {iter_dt.toString('yyyy-MM-dd HH:mm')}")
                 except Exception:
                     pass
-                # 予定（開始/終了）はトグルに従う
+                # 予定（開始/終了）はトグルに従う（プロファイル予定と表示中インスタント予定。キーは p:/i: で衝突回避）
                 if self.alarm_enabled:
                     for schedule in list(self.schedules):
-                        key_start = f"{iter_date_str}:{schedule.id}:start:{iter_hm}"
+                        key_start = f"{iter_date_str}:p:{schedule.id}:start:{iter_hm}"
                         if schedule.start_time == iter_hm and key_start not in self.alarm_fired_today:
                             try:
                                 self._play_sound_schedule_start()
@@ -1678,11 +1910,36 @@ class MainWindow(QMainWindow):
                                 pass
                             self.alarm_fired_today.add(key_start)
 
-                        key_end = f"{iter_date_str}:{schedule.id}:end:{iter_hm}"
+                        key_end = f"{iter_date_str}:p:{schedule.id}:end:{iter_hm}"
                         if schedule.end_time == iter_hm and key_end not in self.alarm_fired_today:
                             try:
                                 self._play_sound_schedule_end()
                                 print(f"[ALARM DEBUG] schedule end fired: id={schedule.id} time={iter_hm} name={schedule.name}")
+                            except Exception:
+                                pass
+                            self.alarm_fired_today.add(key_end)
+
+                    for schedule in list(self.instant_schedules):
+                        if not schedule.visible:
+                            continue
+                        key_start = f"{iter_date_str}:i:{schedule.id}:start:{iter_hm}"
+                        if schedule.start_time == iter_hm and key_start not in self.alarm_fired_today:
+                            try:
+                                self._play_sound_schedule_start()
+                                print(
+                                    f"[ALARM DEBUG] instant schedule start fired: id={schedule.id} time={iter_hm} name={schedule.name}"
+                                )
+                            except Exception:
+                                pass
+                            self.alarm_fired_today.add(key_start)
+
+                        key_end = f"{iter_date_str}:i:{schedule.id}:end:{iter_hm}"
+                        if schedule.end_time == iter_hm and key_end not in self.alarm_fired_today:
+                            try:
+                                self._play_sound_schedule_end()
+                                print(
+                                    f"[ALARM DEBUG] instant schedule end fired: id={schedule.id} time={iter_hm} name={schedule.name}"
+                                )
                             except Exception:
                                 pass
                             self.alarm_fired_today.add(key_end)
@@ -1710,16 +1967,19 @@ class MainWindow(QMainWindow):
         schedule = self.schedules[self.schedule_list.row(item)]
         self.edit_schedule(schedule)
 
+    def on_instant_item_double_clicked(self, item):
+        """インスタント予定リストのダブルクリックで編集"""
+        row = self.instant_schedule_list.row(item)
+        self.edit_schedule(self.instant_schedules[row])
+
     def update_start_time(self):
         """基準時刻の更新"""
         self.start_time = self.start_time_edit.time().toString("HH:mm")
         # 現在のプロファイルIDでスケジュールを読み込むように修正
         self.schedules = Schedule.load_all_from_db(self.current_profile_id)
-        # タイムバーのスケジュールを更新
-        self.timebar.schedules = self.schedules
         # 基準時刻を設定して再描画
         self.timebar.set_start_time(self.start_time)
-        # スケジュール一覧も更新
+        # スケジュール一覧も更新（タイムライン合成含む）
         self.update_schedule_list()
 
     def update_profile_combo(self):
@@ -1745,8 +2005,6 @@ class MainWindow(QMainWindow):
             # 選択されたプロファイルのスケジュールを読み込む
             self.schedules = Schedule.load_all_from_db(self.current_profile_id)
             self.update_schedule_list()
-            self.timebar.schedules = self.schedules
-            self.timebar.update()
             # プロファイル変更時は当日の通知済みフラグをクリア
             self.alarm_fired_today.clear()
 
@@ -1786,18 +2044,46 @@ class MainWindow(QMainWindow):
             schedule.save_schedule_to_db()
             self.schedules = Schedule.load_all_from_db(self.current_profile_id)
             self.update_schedule_list()
-            self.timebar.schedules = self.schedules
-            self.timebar.update()
             return schedule
+
+    def add_instant_schedule(self):
+        """インスタント予定を追加（プロファイル非依存・既定で表示ON）"""
+        dialog = AddInstantScheduleDialog(self)
+        if dialog.exec():
+            data = dialog.get_data()
+            inst = InstantSchedule(
+                data["name"],
+                data["start_time"],
+                data["end_time"],
+                data["color"],
+                visible=True,
+            )
+            inst.save_to_db()
+            self.instant_schedules = InstantSchedule.load_all_from_db()
+            self.update_instant_schedule_list()
 
     def delete_schedule(self, schedule):
         """スケジュールの削除"""
         # scheduleがQListWidgetItemの場合はScheduleオブジェクトを取得
         if isinstance(schedule, QListWidgetItem):
             schedule = self.schedules[self.schedule_list.row(schedule)]
-        
-        # 確認ダイアログを表示
+
         from PySide6.QtWidgets import QMessageBox
+
+        if isinstance(schedule, InstantSchedule):
+            confirm = QMessageBox()
+            confirm.setIcon(QMessageBox.Question)
+            confirm.setWindowTitle("削除の確認")
+            confirm.setText(f"{schedule.name}を本当に削除しますか？")
+            confirm.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            confirm.setDefaultButton(QMessageBox.No)
+            if confirm.exec() == QMessageBox.Yes:
+                InstantSchedule.delete_from_db(schedule.id)
+                self.instant_schedules.remove(schedule)
+                self.update_instant_schedule_list()
+            return
+
+        # 確認ダイアログを表示
         confirm = QMessageBox()
         confirm.setIcon(QMessageBox.Question)
         confirm.setWindowTitle("削除の確認")
@@ -1809,8 +2095,6 @@ class MainWindow(QMainWindow):
             Schedule.delete_from_db(schedule.id)
             self.schedules.remove(schedule)
             self.update_schedule_list()
-            self.timebar.schedules = self.schedules
-            self.timebar.update()
 
     def update_schedule_list(self):
         """スケジュール一覧の更新"""
@@ -1820,10 +2104,37 @@ class MainWindow(QMainWindow):
             widget = ScheduleListItem(schedule, self)
             item.setSizeHint(widget.sizeHint())
             self.schedule_list.setItemWidget(item, widget)
+        self.rebuild_timeline_schedules()
+
+    def update_instant_schedule_list(self):
+        """インスタント予定一覧の更新"""
+        self.instant_schedule_list.clear()
+        for inst in self.instant_schedules:
+            item = QListWidgetItem(self.instant_schedule_list)
+            widget = InstantScheduleListItem(inst, self)
+            item.setSizeHint(widget.sizeHint())
+            self.instant_schedule_list.setItemWidget(item, widget)
+        self.rebuild_timeline_schedules()
 
     @debug_profile_operation("スケジュール編集")
     def edit_schedule(self, schedule):
         """スケジュールの編集"""
+        if isinstance(schedule, InstantSchedule):
+            dialog = AddInstantScheduleDialog(self, schedule)
+            result = dialog.exec()
+            if result == 1:
+                data = dialog.get_data()
+                schedule.name = data["name"]
+                schedule.start_time = data["start_time"]
+                schedule.end_time = data["end_time"]
+                schedule.color = data["color"]
+                schedule.save_to_db()
+                self.instant_schedules = InstantSchedule.load_all_from_db()
+                self.update_instant_schedule_list()
+            elif result == 2:
+                self.delete_schedule(schedule)
+            return
+
         dialog = AddScheduleDialog(self, schedule)
         result = dialog.exec()
         
@@ -1850,8 +2161,6 @@ class MainWindow(QMainWindow):
             # 現在表示中のプロファイルのスケジュールのみを再読み込み
             self.schedules = Schedule.load_all_from_db(self.current_profile_id)
             self.update_schedule_list()
-            self.timebar.schedules = self.schedules
-            self.timebar.update()
         elif result == 2:  # 削除
             self.delete_schedule(schedule)
 

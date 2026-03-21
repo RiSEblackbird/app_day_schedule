@@ -28,7 +28,7 @@ python app_day_schedule.py
 
 エントリポイント兼本体: `app_day_schedule.py`（単一ファイル。肥大化しているため、新規の大きな責務は別モジュール抽出を検討する）
 
-永続化: アプリフォルダ直下の `schedule.db`（SQLite）、ウィンドウ位置は `window_app_day_schedule.txt`（ホスト名キーの CSV）
+永続化: アプリフォルダ直下の `schedule.db`（SQLite: `schedules` / `instant_schedules` / `free_alarms` 等）、ウィンドウ位置は `window_app_day_schedule.txt`（ホスト名キーの CSV）
 
 ## Do
 
