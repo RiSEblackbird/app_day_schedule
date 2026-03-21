@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QToolTip, QCheckBox, QProgressBar,
     QListView, QTabWidget,
 )
-from PySide6.QtCore import Qt, QTime, QRect, QTimer, QDateTime
+from PySide6.QtCore import Qt, QTime, QRect, QTimer, QDateTime, Signal
 from PySide6.QtGui import QPainter, QColor, QBrush, QPen, QFont, QTransform, QPixmap
 import winsound
 
@@ -26,6 +26,8 @@ WINDOW_HEIGHT = 400
 DEFAULT_START_TIME = "08:00"
 BAR_HEIGHT = 100
 HOUR_WIDTH = 45  # 時間軸の幅を調整
+# タイムバー上のドラッグ: 移動とみなす最小ピクセル距離（誤操作防止）
+TIMEBAR_DRAG_THRESHOLD_PX = 5
 COLORS = [
     "#FF9999", "#99FF99", "#9999FF", "#FFFF99", 
     "#FF99FF", "#99FFFF", "#FFB366", "#B366FF"
@@ -833,6 +835,10 @@ class InstantScheduleListItem(QWidget):
 
 class TimeBarWidget(QWidget):
     """スケジュールバーを描画するウィジェット"""
+
+    # ドラッグ確定時: 対象オブジェクト（Schedule / InstantSchedule）と新しい開始・終了 "HH:mm"
+    schedule_times_changed = Signal(object, str, str)
+
     def __init__(self, start_time, schedules, parent=None):
         super().__init__(parent)
         self.start_time = start_time
@@ -849,8 +855,135 @@ class TimeBarWidget(QWidget):
         self.current_schedule = None
         self.tooltip_position = None
 
+        # タイムバー上ドラッグ（左ボタンでブロックを掴み、30分グリッドにスナップして移動）
+        self._drag_candidate_schedule = None
+        self._drag_anchor_delta_rel = 0
+        self._drag_press_pos = None
+        self._drag_duration_minutes = 0
+        self._drag_active = False
+        self._drag_mouse_grabbed = False
+        self._drag_preview_start = None
+        self._drag_preview_end = None
+
+    @staticmethod
+    def _snap_clock_minutes_30(clock_minutes):
+        """0〜1439 の「時刻の分」表現を最寄りの30分境界に丸める。"""
+        m = int(clock_minutes) % (24 * 60)
+        step = 30
+        snapped = ((m + step // 2) // step) * step
+        if snapped >= 24 * 60:
+            return 0
+        return snapped
+
+    @staticmethod
+    def _clock_minutes_to_hhmm(clock_minutes):
+        m = int(clock_minutes) % (24 * 60)
+        return QTime(m // 60, m % 60).toString("HH:mm")
+
+    def _base_minutes(self):
+        base_time = QTime.fromString(self.start_time, "HH:mm")
+        return base_time.hour() * 60 + base_time.minute()
+
+    def _rel_minutes_at_x(self, x, width):
+        """バー左端＝基準時刻としたときの相対分（0〜24h、描画と同じ整数除算）。"""
+        w = max(int(width), 1)
+        x = max(0, min(int(x), w - 1))
+        return (x * 24 * 60) // w
+
+    def _schedule_start_rel_minutes(self, schedule, base_minutes):
+        """_calculate_schedule_position と同じ基準での開始相対分。"""
+        start = QTime.fromString(schedule.start_time, "HH:mm")
+        start_minutes = (start.hour() * 60 + start.minute()) - base_minutes
+        if start_minutes < 0:
+            start_minutes += 24 * 60
+        return start_minutes
+
+    @staticmethod
+    def _schedule_duration_minutes(schedule):
+        start_m, end_m = schedule.get_minutes()
+        if end_m > start_m:
+            return end_m - start_m
+        return 24 * 60 - start_m + end_m
+
+    def _update_drag_preview(self, pos):
+        """ドラッグ中のプレビュー時刻を更新（本体のリストは変更しない）。"""
+        width = self.width()
+        base_m = self._base_minutes()
+        click_rel = self._rel_minutes_at_x(pos.x(), width)
+        new_start_rel = (click_rel - self._drag_anchor_delta_rel) % (24 * 60)
+        start_clock = (base_m + new_start_rel) % (24 * 60)
+        start_clock = self._snap_clock_minutes_30(start_clock)
+        end_clock = (start_clock + self._drag_duration_minutes) % (24 * 60)
+        self._drag_preview_start = self._clock_minutes_to_hhmm(start_clock)
+        self._drag_preview_end = self._clock_minutes_to_hhmm(end_clock)
+
+    def _reset_drag_state(self):
+        self._drag_candidate_schedule = None
+        self._drag_anchor_delta_rel = 0
+        self._drag_press_pos = None
+        self._drag_duration_minutes = 0
+        self._drag_active = False
+        self._drag_mouse_grabbed = False
+        self._drag_preview_start = None
+        self._drag_preview_end = None
+
+    def mousePressEvent(self, event):
+        """バー上の予定を左クリックでドラッグ候補にする。"""
+        if event.button() == Qt.LeftButton:
+            sched = self._get_schedule_at_position(event.pos())
+            if sched is not None:
+                width = self.width()
+                base_m = self._base_minutes()
+                start_rel = self._schedule_start_rel_minutes(sched, base_m)
+                press_rel = self._rel_minutes_at_x(event.pos().x(), width)
+                self._drag_candidate_schedule = sched
+                self._drag_anchor_delta_rel = press_rel - start_rel
+                self._drag_press_pos = event.pos()
+                self._drag_duration_minutes = self._schedule_duration_minutes(sched)
+                self._drag_active = False
+                self._drag_mouse_grabbed = False
+                self._drag_preview_start = None
+                self._drag_preview_end = None
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._drag_candidate_schedule is not None:
+            sched = self._drag_candidate_schedule
+            if self._drag_active and self._drag_preview_start and self._drag_preview_end:
+                if (
+                    self._drag_preview_start != sched.start_time
+                    or self._drag_preview_end != sched.end_time
+                ):
+                    self.schedule_times_changed.emit(
+                        sched, self._drag_preview_start, self._drag_preview_end
+                    )
+            if self._drag_mouse_grabbed:
+                self.releaseMouse()
+                self._drag_mouse_grabbed = False
+            self.unsetCursor()
+            self._reset_drag_state()
+            self.update()
+        super().mouseReleaseEvent(event)
+
     def mouseMoveEvent(self, event):
-        """マウス移動時のイベントハンドラ"""
+        """マウス移動時: ドラッグ中はプレビュー更新、それ以外はツールチップ用ホバー検出。"""
+        if self._drag_candidate_schedule and (event.buttons() & Qt.LeftButton):
+            dist = (event.pos() - self._drag_press_pos).manhattanLength()
+            if not self._drag_active and dist >= TIMEBAR_DRAG_THRESHOLD_PX:
+                self._drag_active = True
+                self._drag_mouse_grabbed = True
+                self.grabMouse()
+                self.setCursor(Qt.ClosedHandCursor)
+                self.tooltip_timer.stop()
+                QToolTip.hideText()
+                self.current_schedule = None
+                self.tooltip_position = None
+                self._update_drag_preview(event.pos())
+            if self._drag_active:
+                self._update_drag_preview(event.pos())
+                self.update()
+                return
+
         schedule = self._get_schedule_at_position(event.pos())
         
         if schedule != self.current_schedule:
@@ -867,10 +1000,12 @@ class TimeBarWidget(QWidget):
 
     def leaveEvent(self, event):
         """マウスがウィジェットを離れた時のイベントハンドラ"""
-        self.tooltip_timer.stop()
-        QToolTip.hideText()
-        self.current_schedule = None
-        self.tooltip_position = None
+        if not self._drag_active:
+            self.tooltip_timer.stop()
+            QToolTip.hideText()
+            self.current_schedule = None
+            self.tooltip_position = None
+        super().leaveEvent(event)
 
     def showScheduleTooltip(self):
         """スケジュールのツールチップを表示"""
@@ -1015,6 +1150,7 @@ class TimeBarWidget(QWidget):
             self._draw_time_markers(painter)
             self._draw_bar_background(painter)
             self._draw_schedules(painter)
+            self._draw_drag_ghost(painter)
             self._draw_current_time(painter)
             self._draw_current_status(painter)
         finally:
@@ -1101,6 +1237,8 @@ class TimeBarWidget(QWidget):
         
         # まず長いスケジュールを描画
         for i, (schedule1, duration1) in enumerate(sorted_schedules):
+            if self._drag_active and schedule1 is self._drag_candidate_schedule:
+                continue
             # 他のスケジュールとの重なりをチェック
             is_overlapped = False
             for schedule2, duration2 in sorted_schedules[:i]:  # 自分より前（長い）スケジュールとチェック
@@ -1136,6 +1274,46 @@ class TimeBarWidget(QWidget):
                     schedule1,
                     is_overlapped
                 )
+
+    def _draw_drag_ghost(self, painter):
+        """ドラッグ中のみ、移動先の区間を半透明＋破線で重ね描きする。"""
+        if not (
+            self._drag_active
+            and self._drag_candidate_schedule
+            and self._drag_preview_start
+            and self._drag_preview_end
+        ):
+            return
+        width = self.width()
+        base_minutes = self._base_minutes()
+        ghost = Schedule(
+            self._drag_candidate_schedule.name,
+            self._drag_preview_start,
+            self._drag_preview_end,
+            self._drag_candidate_schedule.color,
+        )
+        x_start, x_end, crosses_midnight = self._calculate_schedule_position(
+            ghost, width, base_minutes
+        )
+        painter.save()
+        color = QColor(ghost.color)
+        color.setAlpha(160)
+        pen = QPen(QColor("#333333"))
+        pen.setStyle(Qt.DashLine)
+        pen.setWidth(2)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.setBrush(QBrush(color))
+        y_pos = 40
+        height = BAR_HEIGHT
+        if crosses_midnight:
+            painter.drawRect(QRect(x_start, y_pos, width - x_start, height).adjusted(1, 1, -1, -1))
+            painter.drawRect(QRect(0, y_pos, x_end, height).adjusted(1, 1, -1, -1))
+        else:
+            painter.drawRect(
+                QRect(x_start, y_pos, x_end - x_start, height).adjusted(1, 1, -1, -1)
+            )
+        painter.restore()
 
     def _check_overlap(self, schedule1, schedule2):
         """2つのスケジュール間の重なりをチェック（5分以上の重なりがある場合にTrue）"""
@@ -1658,6 +1836,7 @@ class MainWindow(QMainWindow):
         
         # タイムバー（表示内容は rebuild_timeline_schedules で合成リストを渡す）
         self.timebar = TimeBarWidget(self.start_time, self._timeline_schedules)
+        self.timebar.schedule_times_changed.connect(self.on_timebar_schedule_times_changed)
         layout.addWidget(self.timebar)
         
         # タイマーの設定
@@ -1821,6 +2000,21 @@ class MainWindow(QMainWindow):
         self._timeline_schedules = self.schedules + visible_instants
         self.timebar.schedules = self._timeline_schedules
         self.timebar.update()
+
+    def on_timebar_schedule_times_changed(self, schedule, new_start, new_end):
+        """タイムバー上のドラッグで時刻が確定したとき、DB と一覧を既存の編集フローに合わせて更新する。"""
+        if isinstance(schedule, InstantSchedule):
+            schedule.start_time = new_start
+            schedule.end_time = new_end
+            schedule.save_to_db()
+            self.instant_schedules = InstantSchedule.load_all_from_db()
+            self.update_instant_schedule_list()
+            return
+        schedule.start_time = new_start
+        schedule.end_time = new_end
+        schedule.save_schedule_to_db()
+        self.schedules = Schedule.load_all_from_db(self.current_profile_id)
+        self.update_schedule_list()
 
     def update_clock(self):
         """時計表示の更新"""
