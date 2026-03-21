@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QToolTip, QCheckBox, QProgressBar,
     QListView, QTabWidget,
 )
-from PySide6.QtCore import Qt, QTime, QRect, QTimer, QDateTime
+from PySide6.QtCore import Qt, QTime, QRect, QTimer, QDateTime, Signal
 from PySide6.QtGui import QPainter, QColor, QBrush, QPen, QFont, QTransform, QPixmap
 import winsound
 
@@ -26,6 +26,12 @@ WINDOW_HEIGHT = 400
 DEFAULT_START_TIME = "08:00"
 BAR_HEIGHT = 100
 HOUR_WIDTH = 45  # 時間軸の幅を調整
+# タイムバー上のドラッグ: 移動とみなす最小ピクセル距離（誤操作防止）
+TIMEBAR_DRAG_THRESHOLD_PX = 5
+# 予定同士を「重なっている」とみなす最短重なり（分）。描画の段数とヒットテストに共通利用。
+MIN_SCHEDULE_OVERLAP_MINUTES = 5
+# 重なり時は完全分割ではなく、少しずらしながら帯を重ねる。
+LANE_STEP_RATIO = 0.42
 COLORS = [
     "#FF9999", "#99FF99", "#9999FF", "#FFFF99", 
     "#FF99FF", "#99FFFF", "#FFB366", "#B366FF"
@@ -833,6 +839,10 @@ class InstantScheduleListItem(QWidget):
 
 class TimeBarWidget(QWidget):
     """スケジュールバーを描画するウィジェット"""
+
+    # ドラッグ確定時: 対象オブジェクト（Schedule / InstantSchedule）と新しい開始・終了 "HH:mm"
+    schedule_times_changed = Signal(object, str, str)
+
     def __init__(self, start_time, schedules, parent=None):
         super().__init__(parent)
         self.start_time = start_time
@@ -849,8 +859,135 @@ class TimeBarWidget(QWidget):
         self.current_schedule = None
         self.tooltip_position = None
 
+        # タイムバー上ドラッグ（左ボタンでブロックを掴み、30分グリッドにスナップして移動）
+        self._drag_candidate_schedule = None
+        self._drag_anchor_delta_rel = 0
+        self._drag_press_pos = None
+        self._drag_duration_minutes = 0
+        self._drag_active = False
+        self._drag_mouse_grabbed = False
+        self._drag_preview_start = None
+        self._drag_preview_end = None
+
+    @staticmethod
+    def _snap_clock_minutes_30(clock_minutes):
+        """0〜1439 の「時刻の分」表現を最寄りの30分境界に丸める。"""
+        m = int(clock_minutes) % (24 * 60)
+        step = 30
+        snapped = ((m + step // 2) // step) * step
+        if snapped >= 24 * 60:
+            return 0
+        return snapped
+
+    @staticmethod
+    def _clock_minutes_to_hhmm(clock_minutes):
+        m = int(clock_minutes) % (24 * 60)
+        return QTime(m // 60, m % 60).toString("HH:mm")
+
+    def _base_minutes(self):
+        base_time = QTime.fromString(self.start_time, "HH:mm")
+        return base_time.hour() * 60 + base_time.minute()
+
+    def _rel_minutes_at_x(self, x, width):
+        """バー左端＝基準時刻としたときの相対分（0〜24h、描画と同じ整数除算）。"""
+        w = max(int(width), 1)
+        x = max(0, min(int(x), w - 1))
+        return (x * 24 * 60) // w
+
+    def _schedule_start_rel_minutes(self, schedule, base_minutes):
+        """_calculate_schedule_position と同じ基準での開始相対分。"""
+        start = QTime.fromString(schedule.start_time, "HH:mm")
+        start_minutes = (start.hour() * 60 + start.minute()) - base_minutes
+        if start_minutes < 0:
+            start_minutes += 24 * 60
+        return start_minutes
+
+    @staticmethod
+    def _schedule_duration_minutes(schedule):
+        start_m, end_m = schedule.get_minutes()
+        if end_m > start_m:
+            return end_m - start_m
+        return 24 * 60 - start_m + end_m
+
+    def _update_drag_preview(self, pos):
+        """ドラッグ中のプレビュー時刻を更新（本体のリストは変更しない）。"""
+        width = self.width()
+        base_m = self._base_minutes()
+        click_rel = self._rel_minutes_at_x(pos.x(), width)
+        new_start_rel = (click_rel - self._drag_anchor_delta_rel) % (24 * 60)
+        start_clock = (base_m + new_start_rel) % (24 * 60)
+        start_clock = self._snap_clock_minutes_30(start_clock)
+        end_clock = (start_clock + self._drag_duration_minutes) % (24 * 60)
+        self._drag_preview_start = self._clock_minutes_to_hhmm(start_clock)
+        self._drag_preview_end = self._clock_minutes_to_hhmm(end_clock)
+
+    def _reset_drag_state(self):
+        self._drag_candidate_schedule = None
+        self._drag_anchor_delta_rel = 0
+        self._drag_press_pos = None
+        self._drag_duration_minutes = 0
+        self._drag_active = False
+        self._drag_mouse_grabbed = False
+        self._drag_preview_start = None
+        self._drag_preview_end = None
+
+    def mousePressEvent(self, event):
+        """バー上の予定を左クリックでドラッグ候補にする。"""
+        if event.button() == Qt.LeftButton:
+            sched = self._get_schedule_at_position(event.pos())
+            if sched is not None:
+                width = self.width()
+                base_m = self._base_minutes()
+                start_rel = self._schedule_start_rel_minutes(sched, base_m)
+                press_rel = self._rel_minutes_at_x(event.pos().x(), width)
+                self._drag_candidate_schedule = sched
+                self._drag_anchor_delta_rel = press_rel - start_rel
+                self._drag_press_pos = event.pos()
+                self._drag_duration_minutes = self._schedule_duration_minutes(sched)
+                self._drag_active = False
+                self._drag_mouse_grabbed = False
+                self._drag_preview_start = None
+                self._drag_preview_end = None
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._drag_candidate_schedule is not None:
+            sched = self._drag_candidate_schedule
+            if self._drag_active and self._drag_preview_start and self._drag_preview_end:
+                if (
+                    self._drag_preview_start != sched.start_time
+                    or self._drag_preview_end != sched.end_time
+                ):
+                    self.schedule_times_changed.emit(
+                        sched, self._drag_preview_start, self._drag_preview_end
+                    )
+            if self._drag_mouse_grabbed:
+                self.releaseMouse()
+                self._drag_mouse_grabbed = False
+            self.unsetCursor()
+            self._reset_drag_state()
+            self.update()
+        super().mouseReleaseEvent(event)
+
     def mouseMoveEvent(self, event):
-        """マウス移動時のイベントハンドラ"""
+        """マウス移動時: ドラッグ中はプレビュー更新、それ以外はツールチップ用ホバー検出。"""
+        if self._drag_candidate_schedule and (event.buttons() & Qt.LeftButton):
+            dist = (event.pos() - self._drag_press_pos).manhattanLength()
+            if not self._drag_active and dist >= TIMEBAR_DRAG_THRESHOLD_PX:
+                self._drag_active = True
+                self._drag_mouse_grabbed = True
+                self.grabMouse()
+                self.setCursor(Qt.ClosedHandCursor)
+                self.tooltip_timer.stop()
+                QToolTip.hideText()
+                self.current_schedule = None
+                self.tooltip_position = None
+                self._update_drag_preview(event.pos())
+            if self._drag_active:
+                self._update_drag_preview(event.pos())
+                self.update()
+                return
+
         schedule = self._get_schedule_at_position(event.pos())
         
         if schedule != self.current_schedule:
@@ -867,10 +1004,12 @@ class TimeBarWidget(QWidget):
 
     def leaveEvent(self, event):
         """マウスがウィジェットを離れた時のイベントハンドラ"""
-        self.tooltip_timer.stop()
-        QToolTip.hideText()
-        self.current_schedule = None
-        self.tooltip_position = None
+        if not self._drag_active:
+            self.tooltip_timer.stop()
+            QToolTip.hideText()
+            self.current_schedule = None
+            self.tooltip_position = None
+        super().leaveEvent(event)
 
     def showScheduleTooltip(self):
         """スケジュールのツールチップを表示"""
@@ -889,69 +1028,196 @@ class TimeBarWidget(QWidget):
             
             QToolTip.showText(self.tooltip_position, tooltip_text)
 
-    def _get_schedule_at_position(self, pos):
-        """指定された位置にあるスケジュールを取得"""
-        if not (40 <= pos.y() <= 40 + BAR_HEIGHT):  # バーの範囲外
-            return None
+    @staticmethod
+    def _day_intervals_half_open(schedule):
+        """1日のタイムライン上の区間を [start,end) 分で返す。日跨ぎは最大2区間。"""
+        s, e = schedule.get_minutes()
+        if s == e:
+            return []
+        if e > s:
+            return [(s, e)]
+        return [(s, 24 * 60), (0, e)]
+
+    def _interval_lists_overlap_minutes(self, intervals_a, intervals_b):
+        """2つの区間リスト全体での重なり合計が MIN_SCHEDULE_OVERLAP_MINUTES 分以上なら True。"""
+        total_overlap = 0
+        for a0, a1 in intervals_a:
+            for b0, b1 in intervals_b:
+                ov = min(a1, b1) - max(a0, b0)
+                if ov > 0:
+                    total_overlap += ov
+                    if total_overlap >= MIN_SCHEDULE_OVERLAP_MINUTES:
+                        return True
+        return False
+
+    def _check_overlap(self, schedule1, schedule2):
+        """2つのスケジュール間に十分な時間重なりがあるか（日跨ぎ・複数区間を考慮）。"""
+        return self._interval_lists_overlap_minutes(
+            self._day_intervals_half_open(schedule1),
+            self._day_intervals_half_open(schedule2),
+        )
+
+    def _compute_overlap_components(self, schedules):
+        """重なりグラフの連結成分（各成分は list[schedule]）。"""
+        n = len(schedules)
+        idx = {id(s): i for i, s in enumerate(schedules)}
+        adj = [[] for _ in range(n)]
+        for i in range(n):
+            for j in range(i + 1, n):
+                if self._check_overlap(schedules[i], schedules[j]):
+                    adj[i].append(j)
+                    adj[j].append(i)
+        seen = [False] * n
+        out = []
+        for i in range(n):
+            if seen[i]:
+                continue
+            stack = [i]
+            seen[i] = True
+            comp_idx = []
+            while stack:
+                u = stack.pop()
+                comp_idx.append(u)
+                for v in adj[u]:
+                    if not seen[v]:
+                        seen[v] = True
+                        stack.append(v)
+            out.append([schedules[k] for k in comp_idx])
+        return out
+
+    def _max_concurrent_half_open(self, subs):
+        """成分内の同時進行数の最大（スイープライン）。"""
+        events = []
+        for sch in subs:
+            for a, b in self._day_intervals_half_open(sch):
+                events.append((a, 1))
+                events.append((b, -1))
+        if not events:
+            return 1
+        # 同一分で終了(-1)を開始(+1)より先に処理し、接続のみの予定同士を過大カウントしない
+        events.sort(key=lambda t: (t[0], 1 if t[1] > 0 else 0))
+        cur = 0
+        best = 0
+        for _, d in events:
+            cur += d
+            best = max(best, cur)
+        return max(best, 1)
+
+    def _assign_lanes_in_component(self, subs, k_hint):
+        """成分内でレーン番号を割り当て、(lane_by_id, 実際の段数 layers) を返す。"""
+        def min_iv_start(sch):
+            ivs = self._day_intervals_half_open(sch)
+            return min(a for a, _ in ivs) if ivs else 0
+
+        ordered = sorted(
+            subs,
+            key=lambda s: (min_iv_start(s), -TimeBarWidget._schedule_duration_minutes(s)),
+        )
+        lane_by_id = {}
+        k_use = max(1, k_hint)
+        for sch in ordered:
+            placed = False
+            for L in range(k_use):
+                conflict = any(
+                    self._check_overlap(sch, o) for o in lane_by_id if lane_by_id[o] == L
+                )
+                if not conflict:
+                    lane_by_id[sch] = L
+                    placed = True
+                    break
+            if not placed:
+                lane_by_id[sch] = k_use
+                k_use += 1
+        return lane_by_id, k_use
+
+    def _build_lane_layout(self, schedules):
+        """id(schedule) -> {lane, layers}。同一成分では layers が共通。"""
+        layout = {}
+        for subs in self._compute_overlap_components(schedules):
+            k0 = self._max_concurrent_half_open(subs)
+            lane_by_id, layers = self._assign_lanes_in_component(subs, k0)
+            for s in subs:
+                layout[id(s)] = {"lane": lane_by_id[s], "layers": layers}
+        return layout
+
+    @staticmethod
+    def _lane_vertical_slot(lane_index, layer_count):
+        """バー内 y=40 からの縦方向スロット。
         
+        長い予定（lane_index=0）は常に全高（BAR_HEIGHT）を使用し、
+        短い予定（lane_index>0）は下側に寄せて高さを縮めることで、
+        「長い予定が短い予定を包み込む」ような見た目にする。
+        """
+        top = 40
+        if layer_count <= 1 or lane_index == 0:
+            return top, BAR_HEIGHT
+
+        # lane_index >= 1 の短い予定は、下部に寄せる
+        # 段数が増えるほど、より下に、より細く配置される
+        # 例: layer_count=2 の場合、lane 1 は下半分の高さ
+        height = BAR_HEIGHT // (lane_index + 1)
+        y0 = top + (BAR_HEIGHT - height)
+        return y0, height
+
+    def _schedules_effective_and_ghost(self):
+        """描画・ヒットテスト共通の予定列。ドラッグ中は候補をプレビュー用 Schedule に差し替え。
+        戻り値: (effective_list, ghost_or_none)。ghost はプレビュー専用インスタンス。"""
+        if (
+            self._drag_active
+            and self._drag_candidate_schedule
+            and self._drag_preview_start
+            and self._drag_preview_end
+        ):
+            ghost = Schedule(
+                self._drag_candidate_schedule.name,
+                self._drag_preview_start,
+                self._drag_preview_end,
+                self._drag_candidate_schedule.color,
+            )
+            eff = [
+                ghost if s is self._drag_candidate_schedule else s
+                for s in self.schedules
+            ]
+            return eff, ghost
+        return list(self.schedules), None
+
+    def _hit_test_schedule_rects(self, pos, effective, layout_by_id, width, base_minutes, ghost_ref):
+        """位置が入る予定のうち最前面（レーン最大）を返す。ゴースト命中時はドラッグ元オブジェクトを返す。"""
+        best_sch = None
+        best_lane = -1
+        for sch in effective:
+            info = layout_by_id.get(id(sch))
+            if not info:
+                continue
+            lane = info["lane"]
+            layers = info["layers"]
+            y_pos, height = self._lane_vertical_slot(lane, layers)
+            if not (y_pos <= pos.y() <= y_pos + height):
+                continue
+            x_start, x_end, crosses_midnight = self._calculate_schedule_position(
+                sch, width, base_minutes
+            )
+            if crosses_midnight:
+                x_hit = (0 <= pos.x() <= x_end) or (x_start <= pos.x() <= width)
+            else:
+                x_hit = x_start <= pos.x() <= x_end
+            if x_hit and lane > best_lane:
+                best_lane = lane
+                best_sch = sch
+        if best_sch is not None and ghost_ref is not None and best_sch is ghost_ref:
+            return self._drag_candidate_schedule
+        return best_sch
+
+    def _get_schedule_at_position(self, pos):
+        """指定された位置にあるスケジュールを取得（重なり段数・日跨ぎ・ドラッグプレビューと整合）。"""
+        if not (40 <= pos.y() <= 40 + BAR_HEIGHT):
+            return None
         width = self.width()
         base_time = QTime.fromString(self.start_time, "HH:mm")
         base_minutes = base_time.hour() * 60 + base_time.minute()
-        
-        # スケジュールを時間長でソート（長い順）
-        sorted_schedules = []
-        for schedule in self.schedules:
-            start_minutes, end_minutes = schedule.get_minutes()
-            duration = end_minutes - start_minutes if end_minutes > start_minutes else (24 * 60 - start_minutes + end_minutes)
-            sorted_schedules.append((schedule, duration))
-        
-        # 長い順にソート
-        sorted_schedules.sort(key=lambda x: -x[1])
-        
-        # まず、短いスケジュールの領域をチェック
-        for schedule, _ in reversed(sorted_schedules):  # 短い順に
-            x_start, x_end, crosses_midnight = self._calculate_schedule_position(
-                schedule, width, base_minutes
-            )
-            
-            is_overlapped = any(self._check_overlap(schedule, s) for s in self.schedules if s != schedule)
-            if is_overlapped:
-                y_pos = 40 + BAR_HEIGHT // 2
-                height = BAR_HEIGHT // 2
-                
-                # X座標の判定
-                x_in_range = False
-                if crosses_midnight:
-                    x_in_range = (0 <= pos.x() <= x_end) or (x_start <= pos.x() <= width)
-                else:
-                    x_in_range = (x_start <= pos.x() <= x_end)
-                    
-                # 短いスケジュールの領域内ならそれを返す
-                if x_in_range and (y_pos <= pos.y() <= y_pos + height):
-                    return schedule
-        
-        # 短いスケジュールの領域になければ、長いスケジュールをチェック
-        for schedule, _ in sorted_schedules:  # 長い順に
-            x_start, x_end, crosses_midnight = self._calculate_schedule_position(
-                schedule, width, base_minutes
-            )
-            
-            is_overlapped = any(self._check_overlap(schedule, s) for s in self.schedules if s != schedule)
-            y_pos = 40
-            height = BAR_HEIGHT if not is_overlapped else BAR_HEIGHT // 2
-            
-            # X座標の判定
-            x_in_range = False
-            if crosses_midnight:
-                x_in_range = (0 <= pos.x() <= x_end) or (x_start <= pos.x() <= width)
-            else:
-                x_in_range = (x_start <= pos.x() <= x_end)
-                
-            # 長いスケジュールの領域内ならそれを返す
-            if x_in_range and (y_pos <= pos.y() <= y_pos + height):
-                return schedule
-        
-        return None
+        effective, ghost = self._schedules_effective_and_ghost()
+        layout = self._build_lane_layout(effective)
+        return self._hit_test_schedule_rects(pos, effective, layout, width, base_minutes, ghost)
 
     def set_start_time(self, time_str):
         """開始時刻を設定し、その位置をハイライト表示"""
@@ -1082,104 +1348,76 @@ class TimeBarWidget(QWidget):
         painter.drawRect(background_rect)
 
     def _draw_schedules(self, painter):
-        """全スケジュールの描画"""
+        """全スケジュールの描画（重なり連結成分ごとに段数を増やし、ドラッグプレビューは同一レイアウトで描画）。"""
         width = self.width()
-        base_time = QTime.fromString(self.start_time, "HH:mm")
-        base_minutes = base_time.hour() * 60 + base_time.minute()
-        
-        # スケジュールを時間長でソート（長い順）
-        sorted_schedules = []
-        for schedule in self.schedules:
-            start = QTime.fromString(schedule.start_time, "HH:mm")
-            end = QTime.fromString(schedule.end_time, "HH:mm")
-            start_minutes, end_minutes = schedule.get_minutes()
-            duration = end_minutes - start_minutes if end_minutes > start_minutes else (24 * 60 - start_minutes + end_minutes)
-            sorted_schedules.append((schedule, duration))
-        
-        # 長い順にソート
-        sorted_schedules.sort(key=lambda x: (-x[1], x[0].start_time))
-        
-        # まず長いスケジュールを描画
-        for i, (schedule1, duration1) in enumerate(sorted_schedules):
-            # 他のスケジュールとの重なりをチェック
-            is_overlapped = False
-            for schedule2, duration2 in sorted_schedules[:i]:  # 自分より前（長い）スケジュールとチェック
-                if self._check_overlap(schedule1, schedule2):
-                    is_overlapped = True
-                    break
-            
-            x_start, x_end, crosses_midnight = self._calculate_schedule_position(
-                schedule1, width, base_minutes
-            )
-            
-            # 重なっている場合は下部に配置
-            y_pos = 40 + (BAR_HEIGHT // 2 if is_overlapped else 0)
-            height = BAR_HEIGHT // 2 if is_overlapped else BAR_HEIGHT
-            
-            if crosses_midnight:
-                self._draw_schedule_rect(
-                    painter,
-                    QRect(x_start, y_pos, width - x_start, height),
-                    schedule1,
-                    is_overlapped
-                )
-                self._draw_schedule_rect(
-                    painter,
-                    QRect(0, y_pos, x_end, height),
-                    schedule1,
-                    is_overlapped
-                )
-            else:
-                self._draw_schedule_rect(
-                    painter,
-                    QRect(x_start, y_pos, x_end - x_start, height),
-                    schedule1,
-                    is_overlapped
-                )
+        base_minutes = self._base_minutes()
+        effective, ghost = self._schedules_effective_and_ghost()
+        layout_by_id = self._build_lane_layout(effective)
+        for subs in self._compute_overlap_components(effective):
+            layers = layout_by_id[id(subs[0])]["layers"]
+            for lane in range(layers):
+                for sch in subs:
+                    if layout_by_id[id(sch)]["lane"] != lane:
+                        continue
+                    y_pos, height = self._lane_vertical_slot(lane, layers)
+                    drag_preview = ghost is not None and sch is ghost
+                    x_start, x_end, crosses_midnight = self._calculate_schedule_position(
+                        sch, width, base_minutes
+                    )
+                    if crosses_midnight:
+                        self._draw_schedule_rect(
+                            painter,
+                            QRect(x_start, y_pos, width - x_start, height),
+                            sch,
+                            layers,
+                            drag_preview=drag_preview,
+                        )
+                        self._draw_schedule_rect(
+                            painter,
+                            QRect(0, y_pos, x_end, height),
+                            sch,
+                            layers,
+                            drag_preview=drag_preview,
+                        )
+                    else:
+                        self._draw_schedule_rect(
+                            painter,
+                            QRect(x_start, y_pos, x_end - x_start, height),
+                            sch,
+                            layers,
+                            drag_preview=drag_preview,
+                        )
 
-    def _check_overlap(self, schedule1, schedule2):
-        """2つのスケジュール間の重なりをチェック（5分以上の重なりがある場合にTrue）"""
-        start1_minutes, end1_minutes = schedule1.get_minutes()
-        start2_minutes, end2_minutes = schedule2.get_minutes()
-        
-        # 日をまたぐ場合の調整
-        if end1_minutes < start1_minutes:
-            end1_minutes += 24 * 60
-        if end2_minutes < start2_minutes:
-            end2_minutes += 24 * 60
-        
-        # 重なりの判定
-        overlap_start = max(start1_minutes, start2_minutes)
-        overlap_end = min(end1_minutes, end2_minutes)
-        
-        return overlap_end - overlap_start >= 5
-
-    def _draw_schedule_rect(self, painter, rect, schedule, is_overlapped):
-        """個別のスケジュール矩形の描画"""
-        # 境界線の幅を1ピクセル確保
+    def _draw_schedule_rect(self, painter, rect, schedule, layer_count, drag_preview=False):
+        """個別のスケジュール矩形の描画。drag_preview でドラッグ中プレビュー表示。"""
         adjusted_rect = rect.adjusted(1, 1, -1, -1)
-        
-        # 重なっている場合は半透明に
         color = QColor(schedule.color)
-        if is_overlapped:
-            color.setAlpha(200)  # 透明度を設定
+        if drag_preview:
+            color.setAlpha(min(color.alpha(), 160))
+        elif layer_count > 1:
+            # 重なりがある場合、少し透明にして下の予定（長い予定）の色を透けさせる
+            color.setAlpha(220)
+            
         painter.setBrush(QBrush(color))
-        painter.setPen(QPen(QColor("#666666")))
+        if drag_preview:
+            pen = QPen(QColor("#333333"))
+            pen.setStyle(Qt.DashLine)
+            pen.setWidth(2)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+        else:
+            painter.setPen(QPen(QColor("#666666")))
         painter.drawRect(adjusted_rect)
-        
-        # テキストの描画
+
         text_color = get_complementary_color(schedule.color)
         painter.setPen(QPen(text_color))
-        
-        # 経過時間と残り時間の計算
+
         is_current, elapsed_minutes, remaining_minutes = self._get_time_info(schedule)
-        
-        # テキスト表示位置の調整
+
         text_rect = adjusted_rect.adjusted(2, 2, -2, -2)
-        
-        # 領域の幅に応じてテキストの表示方法を変更
+
         if adjusted_rect.width() >= 150:
-            if is_overlapped:
+            if layer_count > 1 or drag_preview:
                 schedule_text = f"{schedule.name}\n{schedule.start_time}-{schedule.end_time}"
             else:
                 schedule_text = f"{schedule.name}\n{schedule.start_time}-{schedule.end_time}"
@@ -1193,7 +1431,7 @@ class TimeBarWidget(QWidget):
             schedule_text = f"{schedule.name}\n{schedule.start_time}"
         else:
             schedule_text = schedule.name
-        
+
         painter.drawText(text_rect, Qt.AlignCenter, schedule_text)
 
     def _calculate_schedule_position(self, schedule, width, base_minutes):
@@ -1658,6 +1896,7 @@ class MainWindow(QMainWindow):
         
         # タイムバー（表示内容は rebuild_timeline_schedules で合成リストを渡す）
         self.timebar = TimeBarWidget(self.start_time, self._timeline_schedules)
+        self.timebar.schedule_times_changed.connect(self.on_timebar_schedule_times_changed)
         layout.addWidget(self.timebar)
         
         # タイマーの設定
@@ -1821,6 +2060,21 @@ class MainWindow(QMainWindow):
         self._timeline_schedules = self.schedules + visible_instants
         self.timebar.schedules = self._timeline_schedules
         self.timebar.update()
+
+    def on_timebar_schedule_times_changed(self, schedule, new_start, new_end):
+        """タイムバー上のドラッグで時刻が確定したとき、DB と一覧を既存の編集フローに合わせて更新する。"""
+        if isinstance(schedule, InstantSchedule):
+            schedule.start_time = new_start
+            schedule.end_time = new_end
+            schedule.save_to_db()
+            self.instant_schedules = InstantSchedule.load_all_from_db()
+            self.update_instant_schedule_list()
+            return
+        schedule.start_time = new_start
+        schedule.end_time = new_end
+        schedule.save_schedule_to_db()
+        self.schedules = Schedule.load_all_from_db(self.current_profile_id)
+        self.update_schedule_list()
 
     def update_clock(self):
         """時計表示の更新"""
