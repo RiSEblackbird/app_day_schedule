@@ -1039,12 +1039,15 @@ class TimeBarWidget(QWidget):
         return [(s, 24 * 60), (0, e)]
 
     def _interval_lists_overlap_minutes(self, intervals_a, intervals_b):
-        """2つの区間リストのいずれかで重なりが MIN_SCHEDULE_OVERLAP_MINUTES 分以上あれば True。"""
+        """2つの区間リスト全体での重なり合計が MIN_SCHEDULE_OVERLAP_MINUTES 分以上なら True。"""
+        total_overlap = 0
         for a0, a1 in intervals_a:
             for b0, b1 in intervals_b:
                 ov = min(a1, b1) - max(a0, b0)
-                if ov >= MIN_SCHEDULE_OVERLAP_MINUTES:
-                    return True
+                if ov > 0:
+                    total_overlap += ov
+                    if total_overlap >= MIN_SCHEDULE_OVERLAP_MINUTES:
+                        return True
         return False
 
     def _check_overlap(self, schedule1, schedule2):
